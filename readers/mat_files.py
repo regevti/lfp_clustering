@@ -1,42 +1,47 @@
 import re
+import h5py
+import pathlib
 from datetime import datetime, time
 import pandas as pd
 import numpy as np
 import xarray as xr
-import h5py
-from utils import butter_lowpass_filter
 from .base import Reader
+
+EXCEL_PATH = '/media/sil2/Data/Lizard/Stellagama/brainStatesSS.xlsx'
 
 
 class MatRecordingsParser(Reader):
-    def __init__(self, root_dir, channel, is_debug=True, animal_id=None, mat_only=False, lowpass=None):
-        super().__init__(root_dir, channel, is_debug)
-        self.xls_table = pd.read_excel('/media/sil2/Data/Lizard/Stellagama/brainStatesSS.xlsx')
+    def __init__(self, root_dir, channel, is_debug=True, animal_id=None, mat_only=False, **kwargs):
+        self.xls_table = pd.read_excel(EXCEL_PATH)
         self.animal_id = animal_id
         self.mat_only = mat_only
-        self.lowpass = lowpass
         self.temp = None
         self.t_start = None
         self.lights_off_id = None
         self.lights_on_id = None
+        super().__init__(root_dir, channel, is_debug, **kwargs)
         self.cache_dir_path.mkdir(exist_ok=True, parents=True)
-        self.v, self.t = self.get_all_recording()
-        self.fs = np.round(1 / np.mean(np.diff(self.t)))
-        if self.lowpass is not None:
-            self.v = butter_lowpass_filter(self.v.flatten(), lowpass, self.fs, order=5)
-        self.sc = self.load_slow_cycles()
 
-    def get_all_recording(self):
-        if self.mat_only and not self.mat_path.exists():
-            raise Exception(f'Unable to find {self.mat_path}')
+    def read(self, i_start=None, i_stop=None):
         if self.mat_path.exists():
             self.print(f'Loading .mat file...')
-            return self.load_mat()
+            v, t = self.load_mat()
         elif self.all_recording_path.exists():
             data = xr.open_dataset(self.all_recording_path)
             v = data.__xarray_dataarray_variable__.to_numpy()
             t = data.time.to_numpy()
-            return v, t
+        else:
+            raise Exception(f'Unable to find {self.mat_path}')
+        v, t = v.flatten(), t.flatten()
+        if i_start is not None:
+            v = v[i_start:]
+        if i_stop is not None:
+            v = v[:i_stop]
+        return v, t
+
+    def load_metadata(self):
+        _, t = self.read()
+        self.fs = np.round(1 / np.mean(np.diff(t)))
 
     def load_mat(self):
         with h5py.File(self.mat_path, 'r') as f:
@@ -85,7 +90,9 @@ class MatRecordingsParser(Reader):
     def mat_path(self):
         return self.cache_dir_path / f'decimate_rec_{self.animal_id}.mat'
 
-
+    @property
+    def cache_dir_path(self) -> pathlib.Path:
+        return self.root_dir / 'regev_cache'
 
     # self.print(f'Initializing an open-ephys reader...')
     # reader = OEReader(self.root_dir)
