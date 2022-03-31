@@ -1,6 +1,65 @@
 import numpy as np
-from scipy.stats import zscore, gaussian_kde
-from scipy.signal import decimate, butter, filtfilt, sosfilt, sosfreqz
+import pandas as pd
+import multiprocessing as mp
+import dask.dataframe as dd
+from dask.multiprocessing import get
+from scipy.stats import zscore, gaussian_kde, pearsonr
+from scipy.special import betainc
+from scipy.signal import decimate, butter, filtfilt, sosfilt, sosfreqz, find_peaks
+
+
+def apply_parallel(df, func, *args, **kwargs):
+    ddata = dd.from_pandas(df, npartitions=30)
+    def apply_myfunc_to_DF(df_): return df_.apply(lambda row: func(row, *args, **kwargs), axis=1)
+    def dask_apply(): return ddata.map_partitions(apply_myfunc_to_DF).compute(scheduler='processes')
+    return dask_apply()
+
+
+def corrcoef(matrix):
+    r = np.corrcoef(matrix)
+    rf = r[np.triu_indices(r.shape[0], 1)]
+    df = matrix.shape[1] - 2
+    ts = rf * rf * (df / (1 - rf * rf))
+    pf = betainc(0.5 * df, 0.5, df / (df + ts))
+    p = np.zeros(shape=r.shape)
+    p[np.triu_indices(p.shape[0], 1)] = pf
+    p[np.tril_indices(p.shape[0], -1)] = p.T[np.tril_indices(p.shape[0], -1)]
+    p[np.diag_indices(p.shape[0])] = np.ones(p.shape[0])
+    return r, p
+
+
+def corrcoef_loop(matrix):
+    rows, cols = matrix.shape[0], matrix.shape[1]
+    r = np.ones(shape=(rows, rows))
+    p = np.ones(shape=(rows, rows))
+    for i in range(rows):
+        for j in range(i+1, rows):
+            r_, p_ = pearsonr(matrix[i], matrix[j])
+            r[i, j] = r[j, i] = r_
+            p[i, j] = p[j, i] = p_
+    return r, p
+
+
+def autocorr(x, t, ax=None):
+    n = x.size
+    norm = (x - np.mean(x))
+    result = np.correlate(norm, norm, mode='same')
+    acorr = result[n//2 + 1:]
+    acorr_norm = result[n//2 + 1:] / (x.var() * np.arange(n-1, n//2, -1))
+    lag = np.abs(acorr_norm).argmax() + 1
+    r = acorr_norm[lag-1]
+    peaks, _ = find_peaks(acorr, prominence=0.1)
+    if len(peaks) == 0:
+        peaks = [len(acorr)-1]
+    t_ = t[n//2 + 1:]
+    t_cyc = t_[peaks][0] - t_[0]
+    power = acorr[peaks][0] / acorr[0]
+    power_norm = acorr_norm[peaks][0] / acorr_norm[0]
+    if ax is not None:
+        ax.plot(t_, acorr)
+        ax.scatter(t_[peaks], acorr[peaks])
+        ax.set_title(f'Tcyc = {t_cyc}, power = {power:.2}, power_norm = {power_norm:.2}\nr = {r:.2},  lag={lag}')
+    return t_cyc, power, power_norm, r, lag
 
 
 def butter_lowpass_filter(x, cutoff, fs, order=2):

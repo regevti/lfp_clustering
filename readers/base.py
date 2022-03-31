@@ -8,12 +8,12 @@ import multiprocessing as mp
 from scipy.io import loadmat
 from scipy.signal import decimate
 from neo.rawio import NeuralynxRawIO
-from utils import butter_lowpass_filter
+from utils import butter_lowpass_filter, apply_parallel
 
 
 class Reader:
     def __init__(self, root_dir=None, channel=None, is_debug=True,
-                 window=None, overlap=None, lowpass=None, decimate_q=None, wavelet=None):
+                 window=0, overlap=0, lowpass=None, decimate_q=None, wavelet=None):
         assert overlap is None or 0 <= overlap <= 1, 'Overlap must be between 0-1'
         self.root_dir = Path(root_dir)
         self.channel = channel
@@ -67,12 +67,13 @@ class Reader:
         sig_df = self.create_sig_df(t, start_indices)
         return V, start_indices, sig_df
 
-    def create_sig_df(self, t, start_indices) -> pd.DataFrame:
+    def create_sig_df(self, t, start_indices, w=None) -> pd.DataFrame:
+        w = w or self.w
         sig_df = []
         sc = self.load_slow_cycles()
         self.print('start creation of sig_df...')
         for startIndex in (tqdm(start_indices) if self.is_debug else start_indices):
-            end_t_index = startIndex + self.w if startIndex + self.w < len(t) else len(t) - 1
+            end_t_index = startIndex + w if startIndex + w < len(t) else len(t) - 1
             sc_id = np.where((sc['on'] <= t[startIndex]) &
                              (sc['off'] >= t[end_t_index]))[0]
             sc_id = int(sc_id[0]) if len(sc_id) == 1 else np.nan
@@ -80,7 +81,7 @@ class Reader:
                 group = 1 if t[startIndex] < sc.loc[sc_id, 'mid'] else 2
             else:
                 group = np.nan
-            sig_df.append((sc_id, startIndex, startIndex + self.w, group))
+            sig_df.append((sc_id, startIndex, startIndex + w, group))
 
         return pd.DataFrame(sig_df, columns=['signal', 'start', 'end', 'group'])
 
@@ -116,22 +117,30 @@ class Reader:
 
 
 class NeoReader(Reader):
+    """Readers based on the neo package. https://neo.readthedocs.io/"""
     _parser_cls = None
 
     def __init__(self, root_dir, channel):
-        super().__init__(root_dir, channel)
         assert self._parser_cls is not None, 'You must use a specific reader'
         self.reader = self._parser_cls(root_dir)
         self.reader.parse_header()
-        self.fs = self.reader.get_signal_sampling_rate()
-        self.t_start = self.reader.get_signal_t_start(block_index=0, seg_index=0)
+        super().__init__(root_dir, channel)
         self.units = self.reader.header['signal_channels'][0]['units']
-        self.sc = self.load_slow_cycles()
+        self.time_vector = self.get_full_time_vector()
+
+    def get_full_time_vector(self):
+        t_start = self.reader.get_signal_t_start(block_index=0, seg_index=0)
+        t_stop = self.reader.get_signal_t_stop(block_index=0, seg_index=0)
+        return np.arange(t_start, t_stop, 1/self.fs)
 
     def read(self, i_start=None, i_stop=None):
         raw_sigs = self.reader.get_analogsignal_chunk(block_index=0, seg_index=0, i_start=i_start, i_stop=i_stop,
                                                       channel_indexes=[self.channel])
-        return self.reader.rescale_signal_raw_to_float(raw_sigs, dtype='float64').flatten()
+        v = self.reader.rescale_signal_raw_to_float(raw_sigs, dtype='float64').flatten()
+        t = self.time_vector[i_start:i_stop]
+        if len(t) > len(v):
+            t = t[:len(v)]
+        return v, t
 
     @property
     def cache_dir_path(self):
@@ -140,6 +149,9 @@ class NeoReader(Reader):
 
 class NeuralynxReader(NeoReader):
     _parser_cls = NeuralynxRawIO
+
+    def load_metadata(self):
+        self.fs = self.reader.get_signal_sampling_rate()
 
     def read(self, i_start=None, i_stop=None):
         raw_sigs = self.reader.get_analogsignal_chunk(block_index=0, seg_index=0, i_start=i_start, i_stop=i_stop,

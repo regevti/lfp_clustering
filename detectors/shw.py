@@ -1,25 +1,26 @@
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 from mne.time_frequency import morlet
 from scipy.interpolate import interp1d
 from scipy.signal import find_peaks, filtfilt
 from readers.mat_files import MatRecordingsParser
-from utils import half_max_x
+from utils import half_max_x, apply_parallel
 
 
 class SharpWavesFinder:
-    def __init__(self, reader: (str, MatRecordingsParser), is_debug=True):
+    def __init__(self, reader: (str, MatRecordingsParser), is_debug=True, shw_duration=1.2):
         self.reader = reader
         self.fs = reader.fs
+        self.shw_w = int(self.fs * shw_duration)
         self.norm_conv = None
         self.thresh = None
-        self.ShWs = None
         self.is_debug = is_debug
         self.v = None
         self.t = None
         self.sc = reader.load_slow_cycles()
-        self.sig_df = None
+        self.shw_df = None
 
     def train(self, cf=1, nc=1, thresh=0.15, mfilt=None, i_start=None, i_stop=None):
         self.v, self.t = self.reader.read(i_start, i_stop)
@@ -29,9 +30,9 @@ class SharpWavesFinder:
 
     def get_sharp_waves(self, cf, nc, thresh, mfilt=None) -> (np.ndarray, list):
         peaks = []
-        V, start_indices, self.sig_df = self.reader.read_segmented(v=self.v, t=self.t)
+        V, conv_start_indices, _ = self.reader.read_segmented(v=self.v, t=self.t)
         self.norm_conv = np.zeros(self.v.shape)
-        for i, start_id in zip(range(V.shape[0]), start_indices):
+        for i, start_id in zip(range(V.shape[0]), conv_start_indices):
             if mfilt is None:
                 # Convolve the wavelet and extract magnitude and phase
                 wlt = morlet(self.reader.fs, [cf], n_cycles=nc)[0]
@@ -45,35 +46,28 @@ class SharpWavesFinder:
             peaks.extend([p + start_id for p in peaks_ if p > 0 and V[i, p] < -10])
             self.norm_conv[start_id:start_id+len(norm_power_)] = norm_power_
 
-        half_w = int(self.reader.w / 2)
-        self.ShWs = np.vstack([self.v[peak - half_w:peak + half_w]
-                               for peak in peaks if peak >= half_w and peak + half_w < len(self.v)])
+        half_w = int(self.shw_w / 2)
+        # self.ShWs = np.vstack([self.v[peak - half_w:peak + half_w]
+        #                        for peak in peaks if peak >= half_w and peak + half_w < len(self.v)])
         # start_indices = [peak - half_w for peak in peaks]
-        self.print(f'Number of sharp waves found: {self.ShWs.shape[0]}')
+        start_indices = [peak - half_w for peak in peaks]
+        self.print(f'Number of sharp waves found: {len(peaks)}')
+        self.shw_df = self.reader.create_sig_df(self.t, start_indices, w=self.shw_w)
 
     def check_sharp_waves(self):
         self.print('start ShW checking...')
-        df = pd.DataFrame(index=self.sig_df.index, columns=['width'])
-        for i, row in self.sig_df.iterrows():
-            t_ = self.t[int(row.start):int(row.end)].flatten()
-            v_ = self.v[int(row.start):int(row.end)].flatten()
-            try:
-                hmx = half_max_x(t_, -v_)
-                df.loc[i, 'width'] = hmx[1] - hmx[0]
-                df.loc[i, 'depth'] = max(-v_)
-            except Exception:
-                continue
-
-        self.sig_df = pd.concat([self.sig_df, df], axis=1)
+        # df = pd.DataFrame(index=self.shw_df.index, columns=['width'])
+        df = apply_parallel(self.shw_df, row_shw_check, self.v, self.t)
+        self.shw_df = pd.concat([self.shw_df, df], axis=1)
         # add the power values for each ShW
-        self.sig_df['power'] = self.norm_conv[self.sig_df.start+(self.sig_df.end-self.sig_df.start)//2]
+        self.shw_df['power'] = self.norm_conv[self.shw_df.start + (self.shw_df.end - self.shw_df.start) // 2]
 
     def calc_sw_rate(self, wt, overlap=0.75, label=None, lights_off_only=False) -> pd.DataFrame:
         """Calculate the rate of slow-waves across all recording"""
         noverlap = int(wt * overlap)
         rf = pd.DataFrame(columns=['rate', 'time', 'group_time', 'group', 'signal', 'datetime'])
-        sig_df = self.sig_df.query(f'label=={label}') if label is not None else self.sig_df.copy()
-        idx = (sig_df.start + self.reader.w).to_numpy().astype(int)
+        sig_df = self.shw_df.query(f'label=={label}') if label is not None else self.shw_df.copy()
+        idx = (sig_df.start + self.shw_w).to_numpy().astype(int)
         idx = idx[idx < len(self.t)]  # remove out of range indices
         sws_times = self.t[idx]
         startT = 0
@@ -121,7 +115,7 @@ class SharpWavesFinder:
         return r, t, rf
 
     def plot_cycle_with_sharp_waves(self, cycle_id, split=1):
-        v, t, start_id = self.reader.get_sleep_cycle(cycle_id)
+        v, t, start_id = self.reader.get_sleep_cycle(cycle_id, t=self.t, v=self.v)
         assert isinstance(split, int)
         fig, axes = plt.subplots(2*split, 1, figsize=(25, 8*split))
         T = np.array_split(t, split)
@@ -130,9 +124,9 @@ class SharpWavesFinder:
         n_shw = 0
         for i, (id_, t_, v_) in enumerate(zip(IDX, T, V)):
             axes[2*i].plot(t_, v_)
-            sf = self.sig_df.query(f'signal=={cycle_id} and group==group and start in {id_.tolist()}')
+            sf = self.shw_df.query(f'signal=={cycle_id} and group==group and start in {id_.tolist()}')
             n_shw += len(sf)
-            idx = sf.start - id_[0] + (self.reader.w / 2)
+            idx = sf.start - id_[0] + (self.shw_w / 2)
             idx = idx.to_numpy().astype(int)
             axes[2*i].plot(t_[idx], v_[idx], 'o', markersize=8)
             axes[2*i+1].plot(t_, self.norm_conv[id_])
@@ -143,10 +137,10 @@ class SharpWavesFinder:
         idx = np.where((self.t >= t_start) & (self.t <= t_end))[0]
         v = self.v[idx]
         t = self.t[idx]
-        sf = self.sig_df.query(f'start>={idx[0]} and end<={idx[-1]}')
+        sf = self.shw_df.query(f'start>={idx[0]} and end<={idx[-1]}')
         ax.plot(t, v, 'k')
         for i, row in sf.iterrows():
-            ax.axvspan(self.t[row.start], self.t[row.end], facecolor='g', alpha=0.4)
+            ax.axvspan(self.t[int(row.start)], self.t[int(row.end)], facecolor='g', alpha=0.4)
         ax.axis('off')
         ylim = ax.get_ylim()
         print(f'Ylim: {ylim[1] - ylim[0]}')
@@ -206,3 +200,14 @@ class SharpWavesFinder:
     def print(self, s):
         if self.is_debug:
             print(s)
+
+
+def row_shw_check(row, v, t):
+    t_ = t[int(row.start):int(row.end)].flatten()
+    v_ = v[int(row.start):int(row.end)].flatten()
+    try:
+        hmx = half_max_x(t_, -v_)
+        s = {'width': hmx[1] - hmx[0], 'depth': max(-v_)}
+    except Exception:
+        s = {'width': None, 'depth': None}
+    return pd.Series(s)
