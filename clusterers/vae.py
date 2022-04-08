@@ -96,6 +96,7 @@ class VAE2:
     def __init__(self, original_dim, intermediate_dim=64, latent_dim=2):
         self.original_dim = original_dim
         self.encoder = None
+        self.decoder = None
         self.vae = self.build(intermediate_dim, latent_dim)
 
     def build(self, intermediate_dim, latent_dim, n_features=1) -> keras.Model:
@@ -111,48 +112,37 @@ class VAE2:
             epsilon = K.random_normal(shape=(batch_size, latent_dim), mean=0., stddev=1.)
             return z_mean + K.exp(0.5 * z_log_sigma) * epsilon
 
-        def vae_loss(inp, original, out, z_log_sigma, z_mean):
+        def vae_loss(original, out, z_log_sigma, z_mean):
             reconstruction = K.mean(K.square(original - out)) * self.original_dim
             kl = -0.5 * K.mean(1 + z_log_sigma - K.square(z_mean) - K.exp(z_log_sigma))
             return reconstruction + kl
 
         # set_seed(33)
         ### encoder ###
-        inp_original = layers.Input(shape=(self.original_dim, 1))
-        inp = layers.Input(shape=(self.original_dim, 1))
-        #
-        # cat_inp = []
-        # cat_emb = []
-        # for cat, i in map_col.items():
-        #     inp_c = layers.Input(shape=(self.original_dim,))
-        #     if cat in ['holiday', 'weather_main', 'weather_description']:
-        #         emb = layers.Embedding(X[cat].max() + 2, 6)(inp_c)
-        #     else:
-        #         emb = layers.Embedding(X[cat].max() + 1, 6)(inp_c)
-        #     cat_inp.append(inp_c)
-        #     cat_emb.append(emb)
-        # concat = layers.Concatenate()(cat_emb + [inp])
-        enc = layers.LSTM(64)(inp)
-        z = layers.Dense(32, activation="relu")(enc)
-        z_mean = layers.Dense(latent_dim)(z)
-        z_log_sigma = layers.Dense(latent_dim)(z)
+        # inp_original = layers.Input(shape=(self.original_dim, 1))
+        inp = layers.Input(shape=(self.original_dim, 1), name='enc_input')
+        enc = layers.LSTM(64, name='enc_lstm')(inp)
+        z = layers.Dense(32, activation="relu", name='enc_dense1')(enc)
+        z = layers.LeakyReLU(alpha=0.3)(z)
+        z = layers.Dropout(rate=0.2)(z)
+        z_mean = layers.Dense(latent_dim, name='z_mean')(z)
+        z_log_sigma = layers.Dense(latent_dim, name='z_log_sigma')(z)
         self.encoder = keras.Model([inp], [z_mean, z_log_sigma])
 
         ### decoder ###
         inp_z = layers.Input(shape=(latent_dim,))
         dec = layers.RepeatVector(self.original_dim)(inp_z)
-        dec = layers.Concatenate()([dec])
         dec = layers.LSTM(64, return_sequences=True)(dec)
         out = layers.TimeDistributed(layers.Dense(1))(dec)
-        decoder = keras.Model([inp_z], out)
+        self.decoder = keras.Model([inp_z], out)
 
         ### encoder + decoder ###
         z_mean, z_log_sigma = self.encoder([inp])
         z = layers.Lambda(sampling)([z_mean, z_log_sigma])
-        pred = decoder([z])
+        pred = self.decoder([z])
 
-        vae = keras.Model([inp, inp_original], pred)
-        vae.add_loss(vae_loss(inp, inp_original, pred, z_log_sigma, z_mean))
+        vae = keras.Model([inp], pred)
+        vae.add_loss(vae_loss(inp, pred, z_log_sigma, z_mean))
         vae.compile(loss=None, optimizer=keras.optimizers.Adam(lr=1e-3))
 
         return vae
@@ -160,4 +150,4 @@ class VAE2:
     def train(self, V, test_size=0.1, epochs=100, batch_size=32, is_print=False):
         es = EarlyStopping(patience=10, verbose=1, min_delta=0.001, monitor='val_loss', mode='auto',
                            restore_best_weights=True)
-        self.vae.fit(V, batch_size=batch_size, epochs=epochs, validation_split=test_size, shuffle=False, callbacks=[es])
+        self.vae.fit(V, V, batch_size=batch_size, epochs=epochs, validation_split=test_size, shuffle=False, callbacks=[es])
