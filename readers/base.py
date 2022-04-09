@@ -9,12 +9,12 @@ from scipy.io import loadmat
 from scipy.signal import decimate
 from neo.rawio import NeuralynxRawIO
 from readers.openephys import OpenEphysRawIO
-from utils import butter_lowpass_filter, apply_parallel
+from utils import butter_lowpass_filter, butter_bandpass_filter, butter_highpass_filter, apply_parallel
 
 
 class Reader:
     def __init__(self, root_dir=None, channel=None, is_debug=True,
-                 window=0, overlap=0, lowpass=None, decimate_q=None, wavelet=None,
+                 window=0, overlap=0, decimate_q=None, wavelet=None,
                  use_multiprocessing=True, use_slow_cycles=True, is_flat_cwt=True):
         assert overlap is None or 0 <= overlap <= 1, 'Overlap must be between 0-1'
         self.root_dir = Path(root_dir)
@@ -23,22 +23,39 @@ class Reader:
         self.use_multiprocessing = use_multiprocessing
         self.use_slow_cycles = use_slow_cycles
         self.is_flat_cwt = is_flat_cwt
+        self.decimate_q = decimate_q
+        self.wavelet = wavelet
         self.fs = None
         self.load_metadata()
         assert self.fs is not None, 'No sampling frequency was loaded'
         self.w = int(self.fs * window)
         self.noverlap = int(self.w * overlap)
-        self.lowpass = lowpass
-        self.decimate_q = decimate_q
-        self.wavelet = wavelet
-        if self.decimate_q is not None:
-            self.fs = self.fs / self.decimate_q
 
-    def read(self, i_start=None, i_stop=None):
+    def read(self, i_start=None, i_stop=None, lowpass=None, bandpass=None, highpass=None, filter_order=5):
+        assert sum(x is not None for x in [lowpass, bandpass, highpass]) <= 1, \
+            'You must either choose lowpass, bandpass or highpass'
+        v, t = self._read(i_start, i_stop)
+        if lowpass is not None:
+            v = butter_lowpass_filter(v, lowpass, self.fs, order=filter_order)
+        elif bandpass is not None:
+            assert isinstance(bandpass, (list, tuple)) and len(bandpass) == 2, 'bad bandpass. Should be like (20, 50)'
+            v = butter_bandpass_filter(v, bandpass[0], bandpass[1], self.fs, order=filter_order)
+        elif highpass is not None:
+            v = butter_highpass_filter(v, highpass, self.fs, order=filter_order)
+        return v, t
+
+    def _read(self, i_start=None, i_stop=None):
         raise NotImplemented('No read function')
 
     def load_metadata(self):
-        raise NotImplemented('No load_metadata function')
+        self._parse_header()
+        self.fs = self.get_sampling_frequency()
+
+    def get_sampling_frequency(self):
+        raise NotImplemented('No get_sampling_frequency function')
+
+    def _parse_header(self):
+        raise NotImplemented('No _parse_header function')
 
     def read_segmented(self, i_start=None, i_stop=None, v=None, t=None):
         """
@@ -54,8 +71,6 @@ class Reader:
         """
         if v is None or t is None:
             v, t = self.read(i_start, i_stop)
-        if self.lowpass is not None:
-            v = butter_lowpass_filter(v, self.lowpass, self.fs, order=5)
 
         V, start_indices = buffer(v, self.w, self.noverlap, self.decimate_q, self.is_debug)
         self.print(f'Number of segments after buffering: {len(start_indices)}')
@@ -144,11 +159,23 @@ class NeoReader(Reader):
         super().__init__(root_dir, channel, **kwargs)
         self.units = self.reader.header['signal_channels'][0]['units']
 
+    def load_metadata(self):
+        super().load_metadata()
+        self.time_vector = self.get_full_time_vector()
+
+    def get_sampling_frequency(self):
+        return self.reader.get_signal_sampling_rate()
+
     def _init_reader(self, root_dir):
         self.reader = self._parser_cls(root_dir)
 
     def _parse_header(self):
         self.reader.parse_header()
+
+    def get_full_time_vector(self):
+        t_start = self.reader.segment_t_start(block_index=0, seg_index=0)
+        t_stop = self.reader.segment_t_stop(block_index=0, seg_index=0)
+        return np.arange(t_start, t_stop, (1/self.fs))
 
     def get_time_vector(self, v, i_start, i_stop):
         t = self.time_vector[i_start:i_stop]
@@ -156,30 +183,12 @@ class NeoReader(Reader):
             t = t[:len(v)]
         return t
 
-    def get_full_time_vector(self):
-        t_start = self.reader.segment_t_start(block_index=0, seg_index=0)
-        t_stop = self.reader.segment_t_stop(block_index=0, seg_index=0)
-        return np.arange(t_start, t_stop, (1/self.fs))
-
-    def read(self, i_start=None, i_stop=None):
-        v, t = self._read()
-        if self.decimate_q:
-            v = decimate(v, self.decimate_q)
-            t = decimate(t, self.decimate_q)
-        return v, t
-
     def _read(self, i_start=None, i_stop=None):
         raw_sigs = self.reader.get_analogsignal_chunk(block_index=0, seg_index=0, i_start=i_start, i_stop=i_stop,
                                                       channel_indexes=[self.channel])
         v = self.reader.rescale_signal_raw_to_float(raw_sigs, dtype='float64').flatten()
         t = self.get_time_vector(v, i_start, i_stop)
         return v, t
-
-    def load_metadata(self):
-        self._parse_header()
-        self.fs = self.reader.get_signal_sampling_rate()
-        self.time_vector = self.get_full_time_vector()
-
 
     @property
     def cache_dir_path(self):
@@ -210,7 +219,7 @@ class OpenEphysReader(NeoReader):
         return np.arange(0, t_stop - t_start, (1 / self.fs))
 
 
-def buffer(X: np.ndarray, w, noverlap=0, is_debug=True):
+def buffer(X: np.ndarray, w, noverlap=0, decimate_q=None, is_debug=True):
     """buffers data vector X into length n column vectors with overlap p; excess data at the end of X is discarded"""
     w = int(w)  # length of each data vector
     noverlap = int(noverlap)  # overlap of data vectors, 0 <= p < n-1
@@ -221,6 +230,8 @@ def buffer(X: np.ndarray, w, noverlap=0, is_debug=True):
     data = []
     for startIndex, segment_id in all_iterations:
         x = X[startIndex:startIndex + w]
+        if decimate_q:
+            x = decimate_q(x, decimate_q)
         data.append(x)
     data = np.vstack(data)
     if is_debug:
