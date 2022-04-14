@@ -126,3 +126,7 @@ def half_max_x(x, y):
     zero_crossings_i = np.where(zero_crossings)[0]
     return [lin_interp(x, y, zero_crossings_i[0], half),
             lin_interp(x, y, zero_crossings_i[-1], half)]
+
+
+def consecutive(data, stepsize=1):
+    return np.split(data, np.where(np.diff(data) != stepsize)[0]+1)
