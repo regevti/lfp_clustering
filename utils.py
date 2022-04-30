@@ -1,11 +1,14 @@
 import numpy as np
 import pandas as pd
+from pathlib import Path
 import multiprocessing as mp
 import dask.dataframe as dd
 from dask.multiprocessing import get
 from scipy.stats import zscore, gaussian_kde, pearsonr
 from scipy.special import betainc
-from scipy.signal import decimate, butter, filtfilt, sosfilt, sosfreqz, find_peaks
+from scipy.signal import decimate, butter, filtfilt, sosfilt, sosfreqz, find_peaks, correlate
+
+ROOT_DIR = Path(__file__).parent.resolve()
 
 
 def apply_parallel(df, func, *args, **kwargs):
@@ -60,6 +63,18 @@ def autocorr(x, t, ax=None):
         ax.scatter(t_[peaks], acorr[peaks])
         ax.set_title(f'Tcyc = {t_cyc}, power = {power:.2}, power_norm = {power_norm:.2}\nr = {r:.2},  lag={lag}')
     return t_cyc, power, power_norm, r, lag
+
+
+def cross_correlate(x, y):
+    """Calculate and plot cross-correlation (full) between two signals."""
+    N = max(len(x), len(y))
+    n = min(len(x), len(y))
+    if N == len(y):
+        lags = np.arange(-N + 1, n)
+    else:
+        lags = np.arange(-n + 1, N)
+    c = correlate(x / np.std(x), y / np.std(y), 'full') / n
+    return c, lags
 
 
 def butter_lowpass_filter(x, cutoff, fs, order=2):

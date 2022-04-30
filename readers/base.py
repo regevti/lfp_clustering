@@ -196,6 +196,7 @@ class NeoReader(Reader):
 
 
 class NeuralynxReader(NeoReader):
+    # TODO: fix the exception in nlxheader.py (line 253) for Mark's recordings
     _parser_cls = NeuralynxRawIO
 
     def _read(self, i_start=None, i_stop=None):
