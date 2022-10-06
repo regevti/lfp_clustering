@@ -1,4 +1,3 @@
-from .base import Reader, NeuralynxReader
+from .base import Reader, NeuralynxReader, OpenEphysReader, BinaryReader, ExcelReader
 from .mat_files import MatRecordingsParser
-from .openephys import OpenEphysRawIO
 from .snakes import SnakeReader

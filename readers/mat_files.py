@@ -43,6 +43,9 @@ class MatRecordingsParser(Reader):
         _, t = self.read()
         return np.round(1 / np.mean(np.diff(t)))
 
+    def load_metadata(self):
+        self.fs = self.get_sampling_frequency()
+
     def load_mat(self):
         with h5py.File(self.mat_path, 'r') as f:
             v = np.array(f['v']).flatten()

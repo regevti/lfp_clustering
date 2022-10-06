@@ -86,6 +86,11 @@ class OpenEphysRawIO(BaseRawIO):
         self._sig_timestamp0 = {}
         signal_channels = []
         oe_indices = sorted(list(info['continuous'].keys()))
+
+        # fix for recordings in which there is no CH prefix
+        if len(oe_indices) > 0 and re.match(r'\d+_\d+.continuous', info['continuous'][oe_indices[0]][0]):
+            self.channels2load = [c.replace('CH', '') for c in self.channels2load]
+
         for seg_index, oe_index in enumerate(oe_indices):
             self._sigs_memmap[seg_index] = {}
 
@@ -118,10 +123,10 @@ class OpenEphysRawIO(BaseRawIO):
                 all_samplerate.append(chan_info['sampleRate'])
 
                 # check for continuity (no gaps)
-                diff = np.diff(data_chan['timestamp'])
-                assert np.all(diff == RECORD_SIZE), \
-                    'Not continuous timestamps for {}. ' \
-                    'Maybe because recording was paused/stopped.'.format(continuous_filename)
+                # diff = np.diff(data_chan['timestamp'])
+                # assert np.all(diff == RECORD_SIZE), \
+                #     'Not continuous timestamps for {}. ' \
+                #     'Maybe because recording was paused/stopped.'.format(continuous_filename)
 
                 if seg_index == 0:
                     # add in channel list
@@ -319,6 +324,10 @@ class OpenEphysRawIO(BaseRawIO):
         elif self.channels2load:
             n_idx = len(channel_indexes)
             channel_indexes = self.get_channel_names(channel_indexes)
+            # fix for cases in which there's no CH prefix
+            if 'CH' not in self.channels2load[0]:
+                channel_indexes = [c.replace('CH', '') for c in channel_indexes]
+
             channel_indexes = [i for i, ch in enumerate(self.header['signal_channels']) if ch[0] in channel_indexes]
             assert len(channel_indexes) == n_idx, 'error loading channels, check you channels names. Should be CH17 for example'
         global_channel_indexes = global_channel_indexes[channel_indexes]
@@ -407,13 +416,7 @@ class OpenEphysRawIO(BaseRawIO):
     def get_channel_names(channels):
         if not isinstance(channels, (list, tuple, np.ndarray)):
             channels = [channels]
-        _channels = []
-        for ch in channels:
-            if isinstance(ch, (int, np.int64)):
-                ch = f'CH{ch}'
-            assert ch.startswith('CH'), f'Channel name must start with CH; Value found: {ch}'
-            _channels.append(ch)
-        return _channels
+        return [f'CH{ch}' for ch in channels]
 
 
 continuous_dtype = [('timestamp', 'int64'), ('nb_sample', 'uint16'),

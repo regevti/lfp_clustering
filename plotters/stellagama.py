@@ -1,18 +1,24 @@
+import re
 import pickle
 import pandas as pd
 import numpy as np
 import matplotlib
+import traceback
 import matplotlib.pyplot as plt
 from matplotlib import cm, font_manager, gridspec
 from tqdm.auto import tqdm
 import seaborn as sns
 from pathlib import Path
 import utils
+import ghostipy as gsp
+from statistics import mode
+from readers import OpenEphysReader
 from readers.mat_files import MatRecordingsParser
 from detectors.shw import SharpWavesFinder
 from scipy.optimize import curve_fit
 from scipy.stats import linregress, ttest_ind
 from scipy.io import savemat, loadmat
+from scipy.signal import find_peaks, hilbert, spectrogram
 
 matplotlib.rcParams['pdf.fonttype'] = 42
 # set paper font
@@ -29,7 +35,8 @@ animal_colors = {
     'SA07': (0.466, 0.674, 0.188),
     'SA09': (0.301, 0.745, 0.933),
     'SA10': (0.635, 0.078, 0.184),
-    'SA11': (0.741, 0.447, 0)
+    'SA11': (0.741, 0.447, 0),
+    'SA15': (0.678, 0.847, 0.902)
 }
 ALPHA = 0.6
 cycles_compare = [
@@ -49,7 +56,7 @@ class StellaPlotter:
         self.avg_shw_shapes = {}
         self.summary_df = pd.DataFrame()
         self.bad_recordings = []
-        self.tmpl = self.get_match_filter()
+        self.tmpl = get_match_filter()
         assert Path(output_folder).exists() and Path(output_folder).is_dir()
         self.output_folder = Path(output_folder) / 'stella_figures'
         self.output_folder.mkdir(exist_ok=True)
@@ -310,12 +317,6 @@ class StellaPlotter:
     def plot_sw_avg_rate(self, ax):
         self._plot_general_metric(ax, 'all_night_avg', use_stat=False, label='mean rate')
 
-    @staticmethod
-    def get_match_filter():
-        with open('../output/template_filter.np', 'rb') as f:
-            tmpl = np.load(f)
-        return tmpl
-
     @property
     def cached_variables(self):
         return ['cycle_t', 'cycles_rates', 'all_nights', 'temps', 'sw_dfs', 'avg_shw_shapes']
@@ -342,3 +343,323 @@ class StellaPlotter:
     def cache_filename(self):
         return self.output_folder / 'cache.pkl'
 
+
+class StellaReviewPlotter:
+    def __init__(self, all_animals_xls, shw_duration=2.5, shw_threshold=0.2, shw_per_rec=1000,
+                 only_sleep=False, exclude=None, min_shws=None, use_cwt_cache=True, cwt_recs=(),
+                 animals_order=None):
+        self.all_animals_xls = all_animals_xls
+        self.tmpl = get_match_filter()
+        self.shw_per_rec = shw_per_rec
+        self.only_sleep = only_sleep
+        self.exclude = exclude
+        self.min_shws = min_shws
+        self.use_cwt_cache = use_cwt_cache
+        self.cwt_recs = cwt_recs
+        self.shw_duration = shw_duration
+        self.shw_threshold = shw_threshold
+        self.animals_order = animals_order
+
+    def ripples_figure(self):
+        sns.set_context('paper', font_scale=1.4)
+
+        fig = plt.figure(tight_layout=True, figsize=(16, 3*4))
+        gs = gridspec.GridSpec(3, 3)
+        example_swf, example_id = self.plot_shw_example(fig.add_subplot(gs[0, 0]))
+        spec, t_spec, f_spec = self.run_cwt(example_swf, [example_id])
+        self.plot_cwt(spec, t_spec, f_spec, fig.add_subplot(gs[1, 0]), is_log_norm=False)
+        B, t_flt, _ = self.get_filtered_shw(example_swf, [example_id])
+        B = np.mean(B, axis=0)
+        self.plot_filtered_trace(B, t_flt, fig.add_subplot(gs[2, 0]))
+
+        all_animals_data = self.analyze_all_animals()
+        self.plot_all_animals_band(fig.add_subplot(gs[1:, 1]), all_animals_data)
+        self.plot_all_animals_cwt(fig.add_subplot(gs[0, 1]), all_animals_data)
+
+        fig.tight_layout()
+        fig.savefig('../output/shw_ripples_stacked.pdf')
+
+    def analyze_all_animals(self, padding=120, max_shws=1000, max_cwt_per_animal=100):
+        animals_data = {}
+        for rp in tqdm(self.all_animals_xls, desc='all_animals_band'):
+            if self.exclude and str(rp) in self.exclude:
+                continue
+            try:
+                swf = self.train_finder(rp, only_sleep=self.only_sleep)
+                if swf is None:
+                    continue
+
+                # shw_df_ = swf.shw_df.query('0.1<=width<0.3 and depth>180 and power>0.3')
+                shw_indices = swf.shw_df.sort_values(by='power', ascending=False).start.values.tolist()
+                if len(shw_indices) > max_shws:
+                    shw_indices = shw_indices[:max_shws]
+                elif len(shw_indices) < self.min_shws:
+                    print(f'{rp} - found only {len(shw_indices)} ShWs; abort')
+                    continue
+                print(f'{rp} | #ShW={len(shw_indices)}')
+                # self.save_shw_timestamps(rp, swf, shw_indices)
+                t_flt, y_flt, t_avg, y_avg, shw_indices = self.run_filtered_and_avg(swf, shw_indices, padding)
+                if str(rp) in self.cwt_recs:
+                    if len(shw_indices) > max_cwt_per_animal:
+                        shw_indices = shw_indices[:max_cwt_per_animal]
+                    S, t_sp, f_sp = self.run_cwt(swf, shw_indices, use_cache=self.use_cwt_cache)
+                else:
+                    S, t_sp, f_sp = None, None, None
+
+                animal_id, rec_id = str(rp).split(',')[0], str(rp)
+                d = animals_data.setdefault(animal_id, {'t_flt': [], 'y_flt': [], 't_avg': [], 'y_avg': [],
+                                                        'rec_id': [], 'S': [], 't_sp': [], 'f_sp': []})
+                for k, l in d.items():
+                    l.append(locals()[k])
+            except Exception as exc:
+                print(f'Error training ShW finder for: {rp}\n{traceback.format_exc()}')
+                raise Exception('')
+        return animals_data
+
+    def train_finder(self, rp, shw_threshold=0.2, shw_duration=None, only_sleep=True):
+        shw_duration = shw_duration or self.shw_duration
+        swf = SharpWavesFinder(rp, shw_duration=shw_duration, is_debug=True, max_width=0.8)
+        i_start, i_stop = None, None
+        # if not swf.is_cache_exists(i_start, i_stop, shw_threshold):
+        #     print(f'{rp}: no cache found')
+        #     return
+        swf.train(mfilt=self.tmpl[::-1], thresh=shw_threshold, i_start=i_start, i_stop=i_stop, only_sleep=only_sleep)
+        return swf
+
+    def get_shw_indices(self, rp, swf):
+        shw_df = swf.shw_df.copy()
+        shw_df = shw_df.sort_values('power', ascending=False)[:self.shw_per_rec].reset_index(drop=True)
+        expected_diff = None
+        idx = []
+        for i, row in shw_df.iterrows():
+            i_start, i_stop = int(swf.t[int(row.start)] * rp.fs), int(swf.t[int(row.end)] * rp.fs)
+            diff = i_stop - i_start
+            if i == 0:
+                expected_diff = diff
+            elif diff < expected_diff:
+                i_stop += expected_diff - diff
+            elif diff > expected_diff:
+                i_stop -= diff - expected_diff
+            idx.append((i_start, i_stop))
+        return np.array(idx)
+
+    def run_spectrogram(self, idx, window_sec=0.1, maxy=10000):
+        fs = self.rp.fs
+        nfft = int(window_sec * fs)
+        noverlap = int(nfft * 0.95)  # overlap set to be half of a segment
+        nfft_padded = utils.next_power_of_2(nfft)  # pad segment with zeros for making nfft of power of 2 (better performance)
+        S = None
+        count = 0
+        for i_start, i_stop in tqdm(idx, total=idx.shape[0]):
+            v_, t_ = self.rp.read(i_start=i_start, i_stop=i_stop)
+            # vmin = 20 * np.log10(np.max(v_)) - 40  # hide anything below -90 dBc
+            f_sp, t_sp, Sxx = spectrogram(v_, fs, nperseg=nfft, noverlap=noverlap, nfft=nfft_padded, window='hann')
+            # Sxx = np.abs(Sxx) ** 2 / fs
+            if S is None:
+                S = Sxx
+            else:
+                S += Sxx
+            count += 1
+        f_idx = (f_sp >= 20) & (f_sp <= 700)
+        f_sp = f_sp[f_idx]
+        S = S[f_idx, :]
+        S = S / count
+        return S, t_sp, f_sp
+
+    def run_cwt(self, swf, idx, use_cache=False):
+        cache_path = swf.reader.cache_dir_path / f'cwt_shw_{len(idx)}.pkl'
+        if use_cache and cache_path.exists():
+            print(f'{swf.reader}: loading CWT cache')
+            with cache_path.open('rb') as f:
+                d = pickle.load(f)
+                S, t_sp, f_sp = d['S'], d['t_sp'], d['f_sp']
+        else:
+            S = None
+            count = 0
+            shw_length = int(swf.shw_duration_sec * swf.fs)
+            for i in tqdm(idx, desc=f'run_cwt {swf.reader}'):
+                v_, t_ = swf.shw_records[str(i)]
+                if self.check_max_pos(v_) or len(t_) < shw_length:
+                    continue
+                elif len(t_) > shw_length:
+                    v_, t_ = v_[:shw_length], t_[:shw_length]
+                v_ = utils.notch_filter(v_, swf.fs)
+                Sxx, _, f_sp, t_sp, _ = gsp.cwt(v_, fs=swf.fs, timestamps=t_, freq_limits=[20, 500], voices_per_octave=32)
+                Sxx = np.abs(Sxx) ** 2 / swf.fs
+                if S is None:
+                    S = Sxx
+                else:
+                    S += Sxx
+                count += 1
+            S = S / count
+            cache_path.parent.mkdir(exist_ok=True, parents=True)
+            with cache_path.open('wb') as f:
+                pickle.dump({'S': S, 't_sp': t_sp, 'f_sp': f_sp}, f)
+
+        return S, t_sp, f_sp
+
+    def get_filtered_shw(self, swf, idx, freq_limits=(60, 199), order=5):
+        B = []
+        for i in idx.copy():
+            v_, t_ = swf.shw_records[str(i)]
+            if self.check_max_pos(v_):
+                idx.remove(i)
+                continue
+            band_v = utils.butter_bandpass_filter(v_, freq_limits[0], freq_limits[1], fs=swf.reader.fs, order=order)
+            B.append(band_v)
+        return B, t_ - t_[0], idx
+
+    def run_hilbert(self, B):
+        modeB = mode([len(b) for b in B])
+        hilb = np.zeros((modeB,))
+        count = 0
+        for b in B:
+            if len(b) != modeB:
+                continue
+            analytic_signal = hilbert(b)
+            b = np.abs(analytic_signal)
+            hilb += b
+            count += 1
+        return hilb / count
+
+    def run_filtered_and_avg(self, swf, shw_indices, padding):
+        B, t_flt, shw_indices = self.get_filtered_shw(swf, shw_indices)
+        analytic = self.run_hilbert(B)
+        y_flt = analytic[padding:-padding]
+        y_flt = (y_flt - y_flt.mean()) / y_flt.std()
+        t_avg, y_avg = swf.get_avg_shw(is_plot=False, shw_indices=shw_indices)
+        y_avg = (y_avg - y_avg.mean()) / y_avg.std()
+        return t_flt, y_flt, t_avg, y_avg, shw_indices
+
+    @staticmethod
+    def plot_filtered_trace(filtered_signal, t, ax, padding=None):
+        if padding:
+            t, filtered_signal = t[padding:-padding], filtered_signal[padding:-padding]
+        ax.plot(t, filtered_signal, c='k')
+        # plt.title('Band=150-350Hz, order=5, ShW are centered around t=0.35s')
+        ax.set_xlabel('Time [sec]')
+        ax.set_ylabel('Band-passed filtered')
+        ax.grid(False)
+
+    @staticmethod
+    def plot_cwt(S, t_sp, f_sp, ax, is_log_norm=False, vmin=None):
+        ax.grid(False)
+        # S = S.copy()
+        # S = S/S.mean(axis=0)[None,:]
+        norm = matplotlib.colors.LogNorm() if is_log_norm else None
+        if vmin:
+            S = 10*np.log10(S/S.max())
+        ax.pcolormesh(t_sp - t_sp[0], f_sp, S, cmap='jet', vmin=vmin, norm=norm)
+        ax.set_xlabel('Time [sec]')
+        ax.set_ylabel('Frequency [Hz]')
+
+    def plot_shw_example(self, ax):
+        example_rp = self.all_animals_xls.get('SA07', '4', desired_fs=1000)
+        example_id = '429177323'
+        swf = self.train_finder(example_rp, shw_duration=1.2)
+        v_, t_ = swf.shw_records[example_id]
+        ax.plot(t_ - t_[0], v_, c='k')
+        ax.set_xlabel('Time [sec]')
+        ax.set_ylabel('Voltage [mV]')
+        ax.grid(False)
+        return swf, example_id
+
+    def plot_best_shw(self, rp, n=30, cols=4):
+        swf = self.train_finder(rp)
+        shw_indices = self.get_shw_indices(rp, swf)
+        rows = int(np.ceil(n / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(25, 4*rows))
+        i = 0
+        for ax, (i_start, i_stop) in zip(axes.flatten(), shw_indices):
+            v_, t_ = rp.read(i_start=i_start, i_stop=i_stop)
+            ax.plot(t_, v_, c='k')
+            ax.set_title(str(i))
+            i += 1
+        fig.tight_layout()
+
+    def plot_all_animals_band(self, ax, animals_data, padding=120):
+        prev_max = 0
+        if self.animals_order:
+            animals_data = {k: v for k, v in sorted(animals_data.items(), key=lambda x: self.animals_order.index(x))}
+        for animal_id, d in animals_data.items():
+            is_label_set = False
+            animal_max = 0
+            for t_flt, y_flt, t_avg, y_avg, rec_id in zip(d['t_flt'], d['y_flt'], d['t_avg'], d['y_avg'], d['rec_id']):
+                y_flt = y_flt + (prev_max + 1 - y_flt.min())
+                y_avg = y_avg + (prev_max + 1 - y_avg.max())
+                label = animal_id if not is_label_set else None
+                ax.plot(t_flt[padding:-padding], y_flt, c=animal_colors[animal_id], label=label)
+                if not is_label_set:
+                    is_label_set = True
+                ax.plot(t_avg[padding:-padding], y_avg[padding:-padding], c=animal_colors[animal_id])
+                # ax.text(t_flt[-1], y_flt.max(), rec_id, c=animal_colors[animal_id])
+                if y_flt.max() > animal_max:
+                    animal_max = y_flt.max()
+            prev_max = animal_max + 2
+
+        ax.set_xlabel('Time [sec]')
+        ax.set_ylabel('Band passed filtered signals + Average ShW')
+        ax.legend(bbox_to_anchor=(-0.2, 0.9))
+        ax.grid(False)
+
+    def plot_all_animals_cwt(self, ax, animals_data):
+        S, t_sp, f_sp, count = None, None, None, 0
+        for animal_id, d in animals_data.items():
+            for S_, t_sp_, f_sp_ in zip(d['S'], d['t_sp'], d['f_sp']):
+                if S_ is None:
+                    continue
+                if S is None:
+                    S, t_sp, f_sp = S_.copy(), t_sp_.copy(), f_sp_.copy()
+                else:
+                    S += S_
+                count += 1
+        S = S / count
+        self.plot_cwt(S, t_sp, f_sp, ax) # , vmin=-10
+
+    def plot_avg_shw(self, ax):
+        prev_max = 0
+        for rp in tqdm(self.all_animals_xls, desc='avg_shw'):
+            rootdir = rp.root_dir.as_posix()
+            swf = self.train_finder(rp)
+            if swf is None:
+                continue
+            shw_indices = self.get_shw_indices(rp, swf)
+            avg_shw = self.get_avg_shw(rp, shw_indices)
+            y = avg_shw
+            y = y + (prev_max + 1 - y.min())
+            prev_max = y.max()
+            rec_label = f"{'/'.join(str(rootdir).split('/')[-2:-1])} ({rp.channel})"
+            ax.plot(np.linspace(0, 0.5, len(y)), y)
+            ax.text(0.5, y.mean(), rec_label)
+
+    def get_avg_shw(self, rp, idx):
+        AVG = None
+
+        for i_start, i_stop in idx:
+            v_, t_ = rp.read(i_start=i_start, i_stop=i_stop)
+            if AVG is None:
+                AVG = v_
+            else:
+                AVG += v_
+
+        AVG = AVG / len(idx)
+        return AVG
+
+    def save_shw_timestamps(self, rp, swf, shw_indices):
+        shw_df = swf.shw_df.query(f'start in {shw_indices}')
+        d = {}
+        for k in ['t_start', 't_end']:
+            d[k] = shw_df[k].to_numpy() * 1000
+        d['power'] = shw_df['power'].to_numpy()
+        path = f'{rp.analysis_folder}/shw_regev.mat'
+        savemat(path, d)
+        print(f'saved timestamps to {path}')
+
+    def check_max_pos(self, v_):
+        return (v_ > 1000).sum() > 10
+
+
+def get_match_filter():
+    with open('../output/template_filter.np', 'rb') as f:
+        tmpl = np.load(f)
+    return tmpl

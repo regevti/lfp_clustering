@@ -9,11 +9,11 @@ import numpy as np
 from numba import cuda
 from typing import Tuple
 from functools import lru_cache
-from scipy.signal import decimate, find_peaks
+from scipy.signal import decimate, find_peaks, resample
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
-
 import utils
-from readers import Reader, NeuralynxReader
+from readers import Reader, NeuralynxReader, OpenEphysReader
 from utils import consecutive
 import matplotlib.colors as mcolors
 
@@ -22,8 +22,8 @@ CAHCE_FILE_NAME = 'cache_fields.gz'
 
 
 class MotifFinder:
-    CACHED_FIELDS = ['motives', 'windows', 'decimate_q', 'lowpass', 'filter_order', 'rd.root_dir', 'rd.channel',
-                     'search_fields']
+    CACHED_FIELDS = ['motives', 'windows', 'decimate_q', 'lowpass', 'filter_order', 'search_fields',
+                     'rd.root_dir', 'rd.channel', 'rd.__class__']
 
     def __init__(self, rd: Reader = None, decimate_q=15, lowpass=150, filter_order=3, cache_dir=None):
         if cache_dir is not None:
@@ -43,49 +43,88 @@ class MotifFinder:
         self.masses = {}
         self.cache_dir = None
 
-    def search(self, t_start, t_stop, durations=(2, 0.4), durations2remove=None, max_overlap=0.8, max_xcorr=0.8,
-               is_cache=False):
-        v, t = self.read_signal(t_start, t_stop)
+    def search(self, t_start=None, t_stop=None, v=None, durations=(2, 0.4), durations2remove=None, max_xcorr=0.8,
+               is_cache=False, is_avg_motives=False, is_remove_corr=True, external_motives=()):
+        """
+        Search for motives in a given signal
+        @param t_start: start time in seconds
+        @param t_stop: end time in seconds
+        @param v: signal for motif search. If provided t_start and t_stop are ignored.
+        @param durations: list of durations (in seconds) for motif search
+        @param durations2remove: list of durations (in seconds) whose match examples should be removed from signal
+        @param max_xcorr: max value of cross-correlation peak. If this value is reached, then the least frequent motif
+                            of the two would be removed.
+        @param is_cache: save found motives to cache directory
+        @param is_avg_motives: Use averaging of all found motif instances for the saved motif
+        @param is_remove_corr: In case of high corr (>max_xcorr) between 2 motives, remove the least frequent one.
+        @param external_motives: list of external motives to be removed from signal before searching.
+        @return: path of cache directory
+        """
+        if v is None:
+            v, _ = self.read_signal(t_start, t_stop)
+        # remove from the signal all the external motif matches
+        for m in external_motives:
+            motif_indices, _ = self.mass_motif_search(m, v, max_dist=30)
+            v = self.remove_motives_from_signal(v, len(m), motif_indices)
+            self.motives.append(m), self.windows.append(len(m))
+        # motif search
         for duration in durations:
             motif_indices, window = self.find_duration_motif(v, duration)
             motives = [v[motif_indices[i, 0]:motif_indices[i, 0]+window] for i in range(motif_indices.shape[0])]
-            good_motives_idx = self.eliminate_cross_correlation(motives, motif_indices, max_xcorr)
-            # good_motives_idx, _ = self.eliminate_overlap_motives(window, max_overlap, motif_indices)
-            for i in good_motives_idx:
-                # append the closest motif to self.motives
-                self.motives.append(v[motif_indices[i, 0]:motif_indices[i, 0]+window])
+            good_motives_idx = np.arange(len(motives))
+            if is_remove_corr:
+                good_motives_idx = self.merge_with_cross_correlation(motives, motif_indices, max_xcorr)
+            for motif_id in good_motives_idx:
+                if is_avg_motives:  # append the avg signal of all found motives
+                    m = np.vstack([v[j:j+window] for j in motif_indices[motif_id, :] if j > 0]).mean(axis=0)
+                else:  # append the closest motif to self.motives
+                    m = v[motif_indices[motif_id, 0]:motif_indices[motif_id, 0]+window]
+                self.motives.append(m)
                 self.windows.append(window)
             if durations2remove and duration in durations2remove:
-                v, t = self.remove_motives_from_signal(v, t, window, motif_indices)
+                v = self.remove_motives_from_signal(v, window, motif_indices)
         self.search_fields.update({k: locals().get(k) for k in self.search_fields.keys()})
         if is_cache:
             self.cache_dir = self.get_cache_dir()
             self.save_cache()
-            self.plot_found_motives(is_save=True)
 
+        self.plot_search_summary(t_start, t_stop, is_save=is_cache)
         return self.cache_dir.as_posix() if is_cache else None
 
-    def find_duration_motif(self, v, window_duration, max_motifs=8) -> Tuple[np.ndarray, int]:
+    def find_duration_motif(self, v, window_duration, max_motifs=20) -> Tuple[np.ndarray, int]:
         window = int(self.fs * window_duration)
         t0 = time.time()
         mps = stumpy.gpu_stump(v, m=window, device_id=self.all_gpu_devices)
         print(f'Finish calculating matrix profile with window of {window_duration} seconds in {(time.time() - t0) / 60:.1f} minutes.')
-        motif_distances, motif_indices = stumpy.motifs(v, mps[:, 0], max_motifs=max_motifs, max_matches=1000)
+        motif_distances, motif_indices = stumpy.motifs(v, mps[:, 0], max_motifs=max_motifs, max_matches=1000, max_distance=30.0)
         return motif_indices, window
 
     def mass_motif_search(self, motif_id, v, max_dist=15, peaks_distance_duration=0.3, is_cache=True):
+        """
+        Find all motives in a given signal
+        @param motif_id: The index of the motif or the motif itself as numpy array
+        @param v: The source signal for searching motives
+        @param max_dist: Maximum minkowsky distance
+        @param peaks_distance_duration: The minimum duration of a peak (used to filter out adjacent motives)
+        @param is_cache: use saved cache if exist, and save to cache the search results
+        @return: (motif indices, distances)
+        """
         t0 = time.time()
+        motif = self.motives[motif_id] if isinstance(motif_id, int) else motif_id
+        is_cache = isinstance(motif_id, int) and is_cache
         if is_cache and motif_id in self.masses:
             dists = self.masses[motif_id]
         else:
-            dists = stumpy.mass(self.motives[motif_id], v)
+            dists = stumpy.mass(motif, v)
             if is_cache:
                 self.masses[motif_id] = dists
             dists = self.filter_adjacent_motives(dists, distance_duration=peaks_distance_duration)
+
         idx = np.where(dists <= max_dist)[0]
         if not (is_cache and motif_id in self.masses):
-            print(f'Motif ID: {motif_id}; Finish mass motif search in {(time.time() - t0) / 60:.1f} minutes.'
-                  f' # of motives found: {len(idx)}')
+            motif_id_label = motif_id if isinstance(motif_id, int) else 'external'
+            # print(f'Motif ID: {motif_id_label}; Finish mass motif search in {(time.time() - t0) / 60:.1f} minutes.'
+            #       f' # of motives found: {len(idx)}')
         return idx, dists
 
     def filter_adjacent_motives(self, dists, distance_duration=0.3):
@@ -135,7 +174,7 @@ class MotifFinder:
         return motives, M
 
     @staticmethod
-    def eliminate_cross_correlation(motives, motif_indices, max_xcorr=0.8):
+    def merge_with_cross_correlation(motives, motif_indices, max_xcorr=0.8):
         remained_motives_ids = list(range(len(motives)))
         for i in range(len(motives)):
             for j in range(i+1, len(motives)):
@@ -172,29 +211,43 @@ class MotifFinder:
                 M[motif_id1, motif_id2] = len(set(full_idx1) & set(full_idx2)) / len(full_idx1)
         return M
 
-    def plot_found_motives(self, cols=5, is_save=False):
-        n_motives = len(self.motives)
-        rows = int(np.ceil(n_motives/cols))
-        fig, axes = plt.subplots(rows, cols, figsize=(25, 4*rows))
-        axes = axes.flatten()
-        for i, m in enumerate(self.motives):
-            t = np.arange(0, len(m)/self.fs, 1/self.fs)
-            axes[i].plot(t, m)
-            axes[i].set_title(f'Motif ID:{i} (window={self.windows[i]/self.fs:.1f}sec)')
-        fig.tight_layout()
-        if is_save:
-            fig.savefig(f'{self.cache_dir}/found_motives.png')
-            plt.close(fig)
+    def plot_search_summary(self, t_start, t_stop, max_dist=35, cols=5, is_save=False):
+        probs, counts = self.sleep_cycles_stats(max_dist=max_dist, t_start=t_start, t_stop=t_stop, is_plot=False)
+        signal_types = ['sws', 'rem']
+        probs2 = [{k: p[k] for k in signal_types} for p in probs]
+        for stype in signal_types:
+            motives_ids = [i for i, p in enumerate(probs2) if max(p, key=p.get)==stype]
+            n_motives = len(motives_ids)
+            if n_motives == 0:
+                print(f'No {stype} motives were found')
+                continue
+            motives = [(i, m, counts[i]) for i, m in enumerate(self.motives) if i in motives_ids]
+            motives = sorted(motives, key=lambda x: x[2], reverse=True)
+            rows = int(np.ceil(n_motives/cols))
+            fig, axes = plt.subplots(rows, cols, figsize=(25, 4*rows))
+            axes = axes.flatten()
+            for ax_id, (i, m, c) in enumerate(motives):
+                t = np.linspace(0, len(m)/self.fs, len(m))
+                axes[ax_id].plot(t, m)
+                axes[ax_id].set_title(f'Motif ID:{i} (window={self.windows[i]/self.fs:.1f}sec)', fontsize=16, weight='bold')
+                ymin, _ = axes[ax_id].get_ylim()
+                axes[ax_id].text(0, ymin+1, f'P(m|REM)={probs[i]["rem"]:.2f}\nP(m|SWS)={probs[i]["sws"]:.2f}\nCount={c}',
+                             color='red', fontsize=16, weight='bold')
+            fig.suptitle(f'{stype.upper()} Motives', fontsize=20)
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if is_save:
+                fig.savefig(f'{self.cache_dir}/found_motives_{stype}.png')
 
     def plot_motif_rate_vs_time(self, motives_ids, max_dist, rate_window=60, overlap=0.5, t_start=None, t_stop=None,
-                                is_normalize=True):
+                                is_normalize=True, colors=None):
         assert isinstance(motives_ids, (list, tuple)), 'motives_ids must be iterable'
         v, t = self.read_signal(t_start, t_stop)
         t_rate, rate, motives_counts = dict(), dict(), dict()
-        for motif_id in motives_ids:
-            _, dists = self.mass_motif_search(motif_id, v, is_cache=(not t_start and not t_stop))
+        for i, motif_id in enumerate(motives_ids):
+            max_dist_ = max_dist[i] if isinstance(max_dist, list) else max_dist
+            _, dists = self.mass_motif_search(motif_id, v, is_cache=(not t_start and not t_stop), max_dist=max_dist_)
             idx = []
-            for idx_group in consecutive(np.where(dists < max_dist)[0]):
+            for idx_group in consecutive(np.where(dists <= max_dist_)[0]):
                 if len(idx_group) == 1:
                     idx.append(idx_group[0])
                 else:
@@ -209,11 +262,13 @@ class MotifFinder:
                 t_rate[motif_id].append(t_start / 3600)
 
         plt.figure(figsize=(25, 6))
+        colors = colors or COLORS
         for motif_id in motives_ids:
             r = np.array(rate[motif_id])
             if is_normalize:
                 r = (r - r.mean()) / r.std()
-            plt.plot(t_rate[motif_id], r, label=f'Motif ID:{motif_id} (#motives={motives_counts[motif_id]}')
+            plt.plot(t_rate[motif_id], r, label=f'Motif ID:{motif_id} (#motives={motives_counts[motif_id]}',
+                     color=colors[motif_id])
         plt.ylabel('Rate [1/sec]')
         plt.xlabel('Time [hours]')
         plt.legend()
@@ -244,44 +299,130 @@ class MotifFinder:
             axes[i].set_title(f'dist={dists[m_id]:.1f}')
         fig.tight_layout()
 
-    def plot_labelled_signal(self, t_start, t_stop, motives_ids=None, max_dist=20, is_save=False):
-        v, t = self.read_signal(t_start, t_stop)
+    def plot_labelled_cycle(self, cycle_id, motives_ids=None, max_dist=20, is_save=False,
+                             colors=None, is_separate=True):
+        colors = colors or COLORS
+        sc = self.rd.load_slow_cycles()
+        v, t = self.read_signal(sc.loc[cycle_id, 'on'], sc.loc[cycle_id, 'off'])
         if motives_ids is None:
             motives_ids = list(range(len(self.motives)))
-        rows = len(motives_ids)
-        fig, axes = plt.subplots(rows, 2, figsize=(25, 5*rows), gridspec_kw={"width_ratios": [1, 8]})
-        for ax in axes[:, 1]:
+        rows = len(motives_ids) if is_separate else 1
+        fig = plt.figure(figsize=(30, 5*rows))
+        outer = fig.add_gridspec(1, 2, wspace=0.1, width_ratios=[1, 9])
+        examples_grid = outer[0].subgridspec(len(motives_ids), 1, wspace=0, hspace=0)
+        signal_grid = outer[1].subgridspec(rows, 1, wspace=0, hspace=0)
+        signal_axes = signal_grid.subplots()
+        examples_axes = examples_grid.subplots()
+        if not is_separate or len(motives_ids) == 1:
+            signal_axes = [signal_axes]
+        if len(motives_ids) == 1:
+            examples_axes = [examples_axes]
+
+        for j, ax in enumerate(signal_axes):
+            if not is_separate:
+                t = t - t[0]
             ax.plot(t, v, color='black')
+            ax.set_xlabel('Time [sec]')
+            ax.set_ylabel('Voltage [mV]')
+
         for j, motif_id in enumerate(motives_ids):
-            axes[j, 0].plot(self.motives[motif_id])
+            ax = examples_axes[j]
+            motif_ = self.motives[motif_id] if isinstance(motif_id, int) else motif_id
+            ax.plot(motif_, color=colors[j])
+            ax.axes.xaxis.set_visible(False)
+            ax.axes.yaxis.set_visible(False)
+            if j == 0:
+                ax.set_title('Motives')
+            sig_ax = signal_axes[j if is_separate else 0]
             max_dist_ = max_dist[j] if isinstance(max_dist, list) else max_dist
             idx, dists = self.mass_motif_search(motif_id, v, max_dist=max_dist_, is_cache=False)
             for i, m_id in enumerate(idx):
-                t_, v_ = t[m_id:m_id+self.windows[motif_id]], v[m_id:m_id+self.windows[motif_id]]
-                axes[j, 1].plot(t_, v_, color=COLORS[motif_id],
-                        label=f'Motif ID: {motif_id}' if i == 0 else None)
-                axes[j, 1].text(t_[0], max(v_)+2, f'{dists[m_id]:.0f}')
-        for ax in axes[:, 1]:
+                t_, v_ = t[m_id:m_id+len(motif_)], v[m_id:m_id+len(motif_)]
+                motif_label = motif_id if isinstance(motif_id, int) else "external"
+                sig_ax.plot(t_, v_, color=colors[j],
+                            label=f'Motif ID: {motif_label}' if i == 0 else None)
+                if is_separate:
+                    sig_ax.text(t_[0], max(v_)+2, f'{dists[m_id]:.0f}\n{np.std(v_):.1f}')
+
+        for ax in signal_axes:
             ax.legend()
-        plt.tight_layout()
+            ax.axvline(sc.loc[cycle_id, 'mid'], color='red')
         if is_save:
-            fig.savefig('labelled_signal.png')
+            fig.savefig(f'labelled_cycle_{cycle_id}.png')
             plt.close(fig)
+
+    def sleep_cycles_stats(self, motives_ids=None, max_dist=30, t_start=None, t_stop=None, is_plot=True):
+        if motives_ids is None:
+            motives_ids = list(range(len(self.motives)))
+        sc = self.rd.load_slow_cycles()
+        v, t = self.read_signal(t_start, t_stop)
+        time_vectors = []
+        for i, motif_id in enumerate(motives_ids):
+            max_dist_ = max_dist[i] if isinstance(max_dist, list) else max_dist
+            idx, _ = self.mass_motif_search(motif_id, v, is_cache=(not t_start and not t_stop), max_dist=max_dist_)
+            time_vectors.append(t[idx])
+
+        durations = {'rem': 0, 'sws': 0}
+        motives_durations = [{'rem': 0, 'sws': 0} for _ in time_vectors]
+        for _, row in sc.iterrows():
+            if (t_stop and row.on >= t_stop) or (t_start and row.off <= t_start):
+                continue
+            durations['sws'] += (row.mid - row.on)
+            durations['rem'] += (row.off - row.mid)
+            for i, t_ in enumerate(time_vectors):
+                d = self.windows[i]/self.fs
+                motives_durations[i]['sws'] += sum([(d if ts+d<row.mid else row.mid - ts)
+                                                      for ts in t_[(row.on <= t_) & (t_ < row.mid)]])
+                motives_durations[i]['rem'] += sum([(d if ts+d<row.off else row.off - ts)
+                                                      for ts in t_[(row.mid <= t_) & (t_ < row.off)]])
+        total_duration = t[-1] - t[0]
+        out_duration = total_duration - (durations['rem'] + durations['sws'])
+        if is_plot:
+            fig, axes = plt.subplots(len(motives_ids), 2, figsize=(10, len(motives_ids)*3))
+        motives_probs, motives_counts = [], []
+        for i, md in enumerate(motives_durations):
+            p_sws, p_rem = md['sws']/durations['sws'], md['rem']/durations['rem']
+            p_out = (len(time_vectors[i]) - (md['sws'] + md['rem'])) / out_duration if out_duration > 1 else 0
+            motives_probs.append({'sws': p_sws, 'rem': p_rem, 'off-cycle': p_out})
+            motives_counts.append(len(time_vectors[i]))
+            if is_plot:
+                axes[i, 0].plot(self.motives[motives_ids[i]])
+                axes[i, 1].bar(['SWS', 'REM', 'off-cycle'], [p_sws, p_rem, p_out])
+        return motives_probs, motives_counts
+
+    def plot_correlations(self, motives=None):
+        motives = motives or self.motives
+        rows = np.arange(len(motives)).sum()
+        fig, axes = plt.subplots(rows, 3, figsize=(20, 3*rows))
+        row = 0
+        for i in range(len(motives)):
+            for j in range(i + 1, len(motives)):
+                corr, lags = utils.cross_correlate(motives[i], motives[j])
+                axes[row, 0].plot(motives[i]), axes[row, 0].set_title(str(i))
+                axes[row, 1].plot(motives[j]), axes[row, 1].set_title(str(j))
+                axes[row, 2].plot(lags, corr), axes[row, 2].set_title(f'max={max(corr):.1f}')
+                row += 1
+        fig.tight_layout()
 
     def read_signal(self, t_start=None, t_stop=None):
         i_start = int(t_start * self.rd.fs) if t_start else None
         i_stop = int(t_stop * self.rd.fs) if t_stop else None
         v, t = self.rd.read(i_start=i_start, i_stop=i_stop, lowpass=self.lowpass, filter_order=self.filter_order)
         if self.decimate_q:
-            v, t = decimate(v, self.decimate_q), decimate(t, self.decimate_q)
+            # v, t = decimate(v, self.decimate_q), decimate(t, self.decimate_q)
+            v, t = resample(v, len(v)//self.decimate_q, t)
         return v, t
 
     @staticmethod
-    def remove_motives_from_signal(v, t, window, motif_indices):
-        idx = np.full(v.shape, True)
-        for i in motif_indices.flatten():
-            idx[i:i + window] = False
-        return v[idx], t[idx]
+    def remove_motives_from_signal(v, window, motif_indices):
+        """remove the motives from the signal and insert a single np.nan in their places"""
+        v_new = []
+        i_start = 0
+        for i in np.sort(motif_indices.flatten()):
+            if i > i_start:
+                v_new.append(np.append(v[i_start:i], np.nan))
+            i_start = i + window
+        return np.hstack(v_new)
 
     def save_cache(self):
         cache = {}
@@ -298,13 +439,18 @@ class MotifFinder:
         with gzip.open(Path(cache_dir) / CAHCE_FILE_NAME, 'rb') as f:
             cache = pickle.load(f)
         rd_kwargs = {}
+        rd_cls = NeuralynxReader
         for attr, value in cache.items():
             if attr.startswith('rd.'):
                 attr = attr.split('.')[1]
+                if attr == '__class__':
+                    rd_cls = value
+                    continue
                 rd_kwargs[attr] = value
             else:
                 setattr(self, attr, value)
-        self.rd = NeuralynxReader(**rd_kwargs)
+
+        self.rd = rd_cls(**rd_kwargs)
 
     @staticmethod
     def get_cache_dir():
