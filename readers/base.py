@@ -1,4 +1,5 @@
 import re
+import os
 from typing import Union
 import pywt
 import numpy as np
@@ -14,7 +15,6 @@ from dataclasses import dataclass
 from neo.rawio import NeuralynxRawIO, RawBinarySignalRawIO
 from readers.openephys import OpenEphysRawIO
 from utils import butter_lowpass_filter, butter_bandpass_filter, butter_highpass_filter, apply_parallel_dask
-
 
 DEFAULT_TABLE = '/media/sil2/Data/Lizard/Stellagama/brainStatesSS.xlsx'
 
@@ -328,6 +328,20 @@ class OpenEphysReader(NeoReader):
         t_start = self.reader.segment_t_start(block_index=0, seg_index=0)
         t_stop = self.reader.segment_t_stop(block_index=0, seg_index=0)
         return np.arange(0, t_stop - t_start, (1 / self.recording_fs))
+
+    def add_CH_to_filename(self):
+        """
+        this method is used only for OE files.
+        the method adds CH to the filename in the format: "100_#.continuous" to "100_CH#.continuous".
+        It will not add CH if it's already there. written by: Milan
+        """
+        files = list(self.root_dir.glob('100_*'))
+
+        for file_name in files:
+            if 'CH' not in file_name.name:
+                split_name = file_name.name.rsplit('_', 1)
+                new_name = split_name[0] + '_CH' + split_name[1]
+                os.rename(file_name.as_posix(), f'{file_name.parent}/{new_name}')
 
 
 class BinaryReader(NeoReader):
