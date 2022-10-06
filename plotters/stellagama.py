@@ -36,7 +36,7 @@ animal_colors = {
     'SA09': (0.301, 0.745, 0.933),
     'SA10': (0.635, 0.078, 0.184),
     'SA11': (0.741, 0.447, 0),
-    'SA15': (0.678, 0.847, 0.902)
+    'SA15': (0.098, 0.325, 0.850)
 }
 ALPHA = 0.6
 cycles_compare = [
@@ -580,7 +580,7 @@ class StellaReviewPlotter:
     def plot_all_animals_band(self, ax, animals_data, padding=120):
         prev_max = 0
         if self.animals_order:
-            animals_data = {k: v for k, v in sorted(animals_data.items(), key=lambda x: self.animals_order.index(x))}
+            animals_data = {k: v for k, v in sorted(animals_data.items(), key=lambda x: self.animals_order.index(x[0]))}
         for animal_id, d in animals_data.items():
             is_label_set = False
             animal_max = 0
