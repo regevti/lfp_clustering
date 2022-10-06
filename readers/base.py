@@ -22,7 +22,7 @@ DEFAULT_TABLE = '/media/sil2/Data/Lizard/Stellagama/brainStatesSS.xlsx'
 @dataclass
 class Reader:
     animal_id: str = None
-    night_id: str = None
+    rec_id: str = None
     root_dir: [str, Path] = None
     channel: int = None
     is_debug: bool = True
@@ -39,14 +39,12 @@ class Reader:
     _parser_cls = None
 
     def __post_init__(self):
-        assert (self.animal_id and self.night_id) or (self.root_dir and self.channel), \
-            'You must specify either animal_id and night_id or root_dir and channel'
+        assert (self.animal_id and self.rec_id) or (self.root_dir and self.channel), \
+            'You must specify either animal_id and rec_id or root_dir and channel'
         assert not self.root_dir or (self.root_dir and self.channel), 'you must provide channel with root_dir'
         assert self.overlap is None or 0 <= self.overlap <= 1, 'Overlap must be between 0-1'
         if isinstance(self.excel_table, str):
             assert Path(self.excel_table).exists(), 'Provided excel table path not exist'
-        if self.night_id:
-            self.night_id = self.night_id.replace('sleepNight', '')
         self.excel_table = self.load_excel_table()
         self.load_rec_params()
         self._init_reader()
@@ -56,14 +54,15 @@ class Reader:
         self.noverlap = int(self.w * self.overlap)
 
     def __str__(self):
-        return f'{self.animal_id}, Night-{self.night_id}'
+        return f'{self.animal_id},{self.rec_id}'
 
     def load_rec_params(self):
-        res = self.excel_table.query(f'Animal=="{self.animal_id}" and recNames=="sleepNight{self.night_id}"')
+        # re.match(rf'\w+')
+        res = self.excel_table.query(f'Animal=="{self.animal_id}" and recNames=="{self.rec_id}"')
         if res.empty:
-            raise Exception(f'unable to find recording for animal_id: {self.animal_id} and night {self.night_id}')
+            raise Exception(f'unable to find recording for animal_id: {self.animal_id} and rec: {self.rec_id}')
         if len(res) > 1:
-            raise Exception(f'more than one option for animal_id: {self.animal_id} and night {self.night_id}')
+            raise Exception(f'more than one option for animal_id: {self.animal_id} and rec: {self.rec_id}')
         self.excel_table = res.iloc[0]
 
         if not self.root_dir:
@@ -251,7 +250,7 @@ class Reader:
 
     @property
     def analysis_folder(self):
-        return self.root_dir / 'analysis' / f'Animal={self.animal_id},recNames=sleepNight{self.night_id}'
+        return self.root_dir / 'analysis' / f'Animal={self.animal_id},recNames={self.rec_id}'
 
 
 class NeoReader(Reader):
@@ -333,8 +332,8 @@ class OpenEphysReader(NeoReader):
 class BinaryReader(NeoReader):
     _parser_cls = RawBinarySignalRawIO
 
-    def __init__(self, animal_id, night_id, fs=20000, **kwargs):
-        super().__init__(animal_id, night_id, fs=fs, **kwargs)
+    def __init__(self, animal_id, rec_id, fs=20000, **kwargs):
+        super().__init__(animal_id, rec_id, fs=fs, **kwargs)
         self.nb_channel = 32
 
     def _init_reader(self):
@@ -362,9 +361,9 @@ class BinaryReader(NeoReader):
 
     @property
     def analysis_folder(self):
-        night_id = self.night_id
-        if night_id.endswith('b'):
-            night_id = night_id[:-1]
+        rec_id = self.rec_id
+        if rec_id.endswith('b'):
+            rec_id = rec_id[:-1]
         analysis_dir = self.root_dir.parent / 'analysis'
         if not analysis_dir.exists():
             alternative = self.root_dir.parent.parent / 'analysis'
@@ -373,7 +372,7 @@ class BinaryReader(NeoReader):
             else:
                 raise Exception(f'Cannot find analysis folder in {analysis_dir} and {alternative}')
 
-        return analysis_dir / f'Animal={self.animal_id},recNames=sleepNight{night_id}'
+        return analysis_dir / f'Animal={self.animal_id},recNames={rec_id}'
 
 
 class ExcelReader:
@@ -395,8 +394,8 @@ class ExcelReader:
     def _repr_html_(self):
         return self.rec_table._repr_html_()
 
-    def get(self, animal_id, night_id, desired_fs=None):
-        res = self.get_row(animal_id, night_id)
+    def get(self, animal_id, rec_id, desired_fs=None):
+        res = self.get_row(animal_id, rec_id)
         rp = self[res.index[0]]
         if desired_fs:
             rp.desired_fs = desired_fs
@@ -413,20 +412,20 @@ class ExcelReader:
     def __len__(self):
         return len(self.rec_table)
 
-    def get_row(self, animal_id, night_id) -> pd.Series:
-        res = self.rec_table.query(f'Animal=="{animal_id}" and recNames=="sleepNight{night_id}"')
+    def get_row(self, animal_id, rec_id) -> pd.Series:
+        res = self.rec_table.query(f'Animal=="{animal_id}" and recNames=="{rec_id}"')
         if res.empty:
-            raise Exception(f'No results for {animal_id} and night {night_id}')
+            raise Exception(f'No results for {animal_id} and rec: {rec_id}')
         elif len(res) > 1:
-            raise Exception(f'More than one result for {animal_id}, night{night_id}')
+            raise Exception(f'More than one result for {animal_id}, recording: {rec_id}')
         return res
 
     def filter(self, recs):
         # rec format example: 'SA04, Night-8b'
         new_df = []
         for r in recs:
-            animal_id, night_id = r.split(', Night-')
-            new_df.append(self.get_row(animal_id, night_id))
+            animal_id, rec_id = r.split(',')
+            new_df.append(self.get_row(animal_id, rec_id))
 
         return ExcelReader(pd.concat(new_df), **self.reader_kwargs)
 
