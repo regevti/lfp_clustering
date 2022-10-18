@@ -7,7 +7,7 @@ from pathlib import Path
 import dask.dataframe as dd
 from scipy.stats import zscore, gaussian_kde, pearsonr
 from scipy.special import betainc
-from scipy.signal import decimate, butter, filtfilt, sosfilt, sosfreqz, find_peaks, correlate, iirnotch, lfilter
+from scipy.signal import decimate, butter, filtfilt, sosfilt, sosfreqz, find_peaks, correlate, iirnotch, lfilter, savgol_filter
 from scipy.cluster.hierarchy import dendrogram
 import matplotlib
 
@@ -115,6 +115,10 @@ def notch_filter(data, fs, f0=50.0, Q=30.0):
     b, a = iirnotch(f0, Q, fs)
     y = lfilter(b, a, data)
     return y
+
+
+def smooth_signal(v, window_size=51, poly_order=3):
+    return savgol_filter(v, window_size, poly_order)
 
 
 def next_power_of_2(x):

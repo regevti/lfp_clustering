@@ -16,9 +16,10 @@ from readers import OpenEphysReader
 from readers.mat_files import MatRecordingsParser
 from detectors.shw import SharpWavesFinder
 from scipy.optimize import curve_fit
-from scipy.stats import linregress, ttest_ind
+from scipy.stats import linregress, ttest_ind, sem
 from scipy.io import savemat, loadmat
 from scipy.signal import find_peaks, hilbert, spectrogram
+
 
 matplotlib.rcParams['pdf.fonttype'] = 42
 # set paper font
@@ -39,15 +40,13 @@ animal_colors = {
     'SA15': (0.098, 0.325, 0.850)
 }
 ALPHA = 0.6
-cycles_compare = [
-        ('SA07', 'SA07_SA09_23_06_21_Trial16_Trial30_18D'),
-        ('SA07', 'SA07_SA09_17_06_21_Trial11_Trial25_27D'),
-        ('SA07', 'SA07_AS09_19_06_21_Trial13_Trial27_35D')
-]
+cycles_compare = ['SA07,sleepNight22', 'SA07,sleepNight24', 'SA07,sleepNight29']
+example_rec = 'SA07,sleepNight25'
 
 
 class StellaPlotter:
-    def __init__(self, output_folder='../output'):
+    def __init__(self, output_folder='../output', shw_duration=1.2, use_cache=True):
+        self.shw_duration = shw_duration
         self.cycle_t = None  # time vector for cycles analyses, needed for plots
         self.cycles_rates = {}
         self.all_nights = {}
@@ -61,30 +60,34 @@ class StellaPlotter:
         self.output_folder = Path(output_folder) / 'stella_figures'
         self.output_folder.mkdir(exist_ok=True)
         self.plots_folder.mkdir(exist_ok=True)
-        self.load_cache()
+        if use_cache:
+            self.load_cache()
         self.colormap = cm.get_cmap('coolwarm', len(set(self.temps.values())))
         self.colors = {int(k): self.colormap(i) for i, k in enumerate(sorted(set(self.temps.values())))}
         self.example_detector = None
 
-    def analyze(self, mats_paths):
-        for p in tqdm(mats_paths):
-            try:
-                i = p.name.find('SA')
-                animal_id = p.name[i:i + 4]
-                rec_id = -4 if p.parts[-3].startswith('Record') else -3
-                rec_name = p.parts[rec_id]
-                name = (animal_id, rec_name)
-                rp, swf = self.init_parsers(p, animal_id)
-                r, self.cycle_t, _ = swf.calc_cycle_sw_rate(wt=20, group_length=150)
-                rf = swf.calc_sw_rate(60 * 60, overlap=0.75, label=None, lights_off_only=True)
-                self.cycles_rates[name] = r
-                self.all_nights[name] = rf
-                self.temps[name] = rp.temp
-                self.sw_dfs[name] = swf.shw_df.copy()
-                if name in cycles_compare:
-                    self.calc_average_shw_shape(rp, name)
-            except Exception as exc:
-                print(f'ERROR; {exc}; {p}')
+    def analyze(self, xls):
+        with tqdm(total=len(xls)) as pbar:
+            for rp in xls:
+                try:
+                    pbar.set_description(str(rp))
+                    swf = self.train_finder(rp)
+                    r, self.cycle_t, _ = swf.calc_cycle_sw_rate(wt=20, group_length=150)
+                    rf = swf.calc_sw_rate(60 * 60, overlap=0.75, label=None, lights_off_only=True)
+                    name = str(rp)
+                    self.cycles_rates[name] = r
+                    self.all_nights[name] = rf
+                    self.temps[name] = self.get_rec_temperature(rp)
+                    sig_df = swf.shw_df.copy()
+                    self.sw_dfs[name] = pd.concat([sig_df,
+                                                   rp.create_sig_df(rp.time_vector,
+                                                                    sig_df.start.values)[['group', 'signal']]], axis=1)
+                    if name in cycles_compare:
+                        self.calc_average_shw_shape(swf, name)
+                    pbar.update(1)
+                except Exception as exc:
+                    print(f'ERROR {rp}; {exc}')
+                    raise exc
         self.temps = {k: v for k, v in sorted(self.temps.items(), key=lambda item: item[1])}
         self.analysis_summary()
         self.save_cache()
@@ -96,8 +99,8 @@ class StellaPlotter:
             all_night = self.all_nights[name]
             q = all_night.datetime.dt.strftime('%H:%M:%S')
             all_night = all_night[(q >= '19:00') | (q <= '07:00')]
-            self.summary_df.loc[i, 'animal_id'] = name[0]
-            self.summary_df.loc[i, 'name'] = name[1]
+            self.summary_df.loc[i, 'animal_id'] = name.split(',')[0]
+            self.summary_df.loc[i, 'name'] = name
             self.summary_df.loc[i, 'temp'] = temp
             # auto-correlation
             self.summary_df.loc[i, ['t_cyc', 'power', 'power_norm', 'r', 'lag']] = utils.autocorr(rate, self.cycle_t)
@@ -115,14 +118,14 @@ class StellaPlotter:
         self.bad_recordings = [tuple(x) for x in self.summary_df.query('power<0.3')[['animal_id',
                                                                                      'name']].to_records(index=False)]
 
-    def calc_average_shw_shape(self, rp, name):
-        v_, _ = rp.read()
-        sf = self.sw_dfs[name].copy()
-        sf.group.fillna(0, inplace=True)
-        self.avg_shw_shapes[name] = []
-        for i, row in sf.iterrows():
-            self.avg_shw_shapes[name].append(v_[int(row.start):int(row.end)])
-        self.avg_shw_shapes[name] = np.vstack(self.avg_shw_shapes[name]).mean(axis=0)
+    def train_finder(self, rp, shw_threshold=0.2, only_sleep=True):
+        swf = SharpWavesFinder(rp, shw_duration=self.shw_duration, is_debug=True, max_width=0.8)
+        swf.train(mfilt=self.tmpl[::-1], thresh=shw_threshold, i_start=None, i_stop=None, only_sleep=only_sleep)
+        return swf
+
+    def calc_average_shw_shape(self, swf, name):
+        _, m = swf.get_avg_shw(is_plot=False)
+        self.avg_shw_shapes[name] = m
 
     def temperature_figure(self):
         """Plot all figures about ShW vs. temperature"""
@@ -152,7 +155,8 @@ class StellaPlotter:
         min_temp, max_temp = int(min(self.temps.values())), int(max(self.temps.values()))
         sm = plt.cm.ScalarMappable(cmap=self.colormap, norm=plt.Normalize(vmin=min_temp, vmax=max_temp))
         cbar_ax = fig.add_axes([0.05, 0.78, 0.01, 0.17])
-        fig.colorbar(sm, cax=cbar_ax, ticks=[min_temp, max_temp])
+        # fig.colorbar(sm, cax=cbar_ax, ticks=[min_temp, max_temp])
+        fig.savefig('../output/stella_figures/plots/temps.pdf')
 
     def supplementary_figure(self):
         swf = self.load_example_detector()
@@ -165,10 +169,11 @@ class StellaPlotter:
         ax.arrow(len(self.tmpl), self.tmpl.mean(), len(self.tmpl) / 2, 0, color=c, head_width=20)
         ax.arrow(0, self.tmpl.mean(), -len(self.tmpl) / 2, 0, color=c, head_width=20)
         ax.axis('off')
-        swf.plot_sharp_waves_detection(26894, 26907, fig.add_subplot(gs[1, :cols - 1]),
-                                        fig.add_subplot(gs[2, :cols - 1]))
+        swf.plot_sharp_waves_detection(swf.reader, self.tmpl, 26894, 26907, fig.add_subplot(gs[1, :cols - 1]),
+                                       fig.add_subplot(gs[2, :cols - 1]))
         ax = fig.add_subplot(gs[1, cols - 1])
-        self.plot_rate_all_night(ax, only_mid=True, is_legend=True)
+        self.plot_rate_all_night(ax, recs=[cycles_compare[1]], is_legend=True)
+        fig.savefig('../output/stella_figures/plots/supplementary.pdf')
 
     def phase_figure(self):
         gdf = []
@@ -195,21 +200,14 @@ class StellaPlotter:
         tt, p_val = ttest_ind(gdf.SWS, gdf.REM, equal_var=False)
         print(f't={tt:.3f} , P={p_val:.1e}')
         fig.tight_layout()
+        fig.savefig('../output/stella_figures/plots/phase.pdf')
 
     def load_example_detector(self) -> SharpWavesFinder:
         if self.example_detector is not None:
             return self.example_detector
-        p = Path(
-            '/media/sil2/Data/Lizard/Stellagama/SA09_SA07/SA07_SA09_17_06_21_Trial11_Trial25_27D/Record Node 117/regev_cache/decimate_rec_SA07.mat')
-        _, swf = self.init_parsers(p, 'SA07')
-        return swf
-
-    def init_parsers(self, p, animal_id):
-        rp = MatRecordingsParser(p.parent.parent.as_posix(), channel=None, is_debug=False, animal_id=animal_id,
-                                 mat_only=True, window=600, overlap=0.75, wavelet=None, lowpass=40)
-        swf = SharpWavesFinder(rp, shw_duration=1.2, is_debug=False)
-        swf.train(mfilt=self.tmpl[::-1], thresh=0.25)
-        return rp, swf
+        animal_id, rec_id = example_rec.split(',')
+        rp = OpenEphysReader(animal_id=animal_id, rec_id=rec_id, desired_fs=300)
+        return self.train_finder(rp)
 
     def plot_sw_around_cycle_transition(self, ax=None):
         if ax is None:
@@ -224,46 +222,50 @@ class StellaPlotter:
         ax.set_xlabel('Time [sec]', fontsize=9)
         ax.set_ylabel('Rate [#ShW/sec]', fontsize=9)
 
-    def plot_rate_all_night(self, ax, only_mid=False, is_legend=None):
+    def plot_rate_all_night(self, ax, recs=(), is_legend=None):
+        hour_start, hour_stop = 17, 9
+        x = np.arange(0, hour_stop + (24 - hour_start), 0.25)
         if ax is None:
             ax = plt.subplot(figsize=(6, 3), dpi=140)
-        for animal_id in ['SA07']:
-            averaged = []
-            n_recs = 0
-            for name, temp in self.temps.items():
-                if name in self.bad_recordings or name[0] != animal_id:
-                    continue
-                rf = self.all_nights[name].copy().reset_index()[['rate', 'time', 'datetime']]
-                rf.time = rf.time / 3600
-                rf.datetime = rf.datetime.dt.strftime('%H:%M')
-                rf_vec = rf.set_index('datetime')['rate']
-                averaged.append(rf_vec.copy())
-                n_recs += 1
-                if name in cycles_compare:
-                    if only_mid and name != ('SA07', 'SA07_SA09_17_06_21_Trial11_Trial25_27D'):
-                        continue
-                    sns.lineplot(data=rf, x='datetime', y='rate', color=self.colors[int(temp)], ax=ax,
-                                 label=is_legend and f'{int(temp)}ºC', zorder=10)
-            if n_recs == 0:
+        averaged = []
+        sumf = self.summary_df.copy().set_index('name')
+        for name, temp in self.temps.items():
+            if sumf.loc[name, 'power'] < 0.4 and (name not in cycles_compare) and (name not in recs):
                 continue
-            avf = pd.DataFrame(averaged).transpose()
-            sns.lineplot(x=avf.index.values, y=avf.mean(axis=1), color='k', ax=ax, label=is_legend and 'Average',
-                         ci=None)
-            ax.fill_between(avf.index.values, avf.mean(axis=1) - avf.sem(axis=1), avf.mean(axis=1) + avf.sem(axis=1),
-                            alpha=0.5)
+            rf = self.all_nights[name].copy().reset_index()[['rate', 'time', 'datetime']]
+            rf.time = rf.time / 3600
+            # rf.datetime = rf.datetime.dt.strftime('%H:%M')
+            dt = rf.datetime.copy().dt
+            rf.datetime = dt.hour + (dt.minute / 60)
+            rf = rf.loc[(rf.datetime >= hour_start) | (rf.datetime <= hour_stop), :]
+            # rf = rf.query(f'datetime >= {hour_start} and datetime <= {hour_stop}')
+            dtm = rf.datetime.copy()
+            rf.loc[dtm >= hour_start, 'datetime'] = rf.loc[dtm >= hour_start, 'datetime'] - hour_start
+            rf.loc[dtm <= hour_stop, 'datetime'] = rf.loc[dtm <= hour_stop, 'datetime'] + (24 - hour_start)
+            rate = np.interp(x, rf.datetime.values, rf.rate.values)
+            averaged.append(rate)
+            if (recs and name not in recs) or (not recs and name not in cycles_compare):
+                continue
+            sns.lineplot(data=rf, x='datetime', y='rate', color=self.colors[int(temp)], ax=ax,
+                         label=is_legend and f'{int(temp)}ºC', zorder=10)
+
+        avf = np.vstack(averaged)
+        sns.lineplot(x=x, y=avf.mean(axis=0), color='k', ax=ax, label=is_legend and 'Average')#,
+                     # ci=None)
+        ax.fill_between(x, avf.mean(axis=0) - sem(avf, axis=0), avf.mean(axis=0) + sem(avf, axis=0), alpha=0.4)
         ax.set_xlabel('Hour', fontsize=9)
         ax.set_ylabel('Rate [#ShW/hour]', fontsize=9)
-        ax.set_xticks(['19:00', '00:00', '07:00'])
-        ax.axvspan('19:00', '07:00', facecolor='silver', alpha=0.3)
+        ax.set_xticks([19-hour_start, (24-hour_start), 7+(24-hour_start)], ['19:00', '00:00', '07:00'])
+        ax.axvspan(19-hour_start, 7+(24-hour_start), facecolor='silver', alpha=0.3)
         if is_legend:
             h, l = ax.get_legend_handles_labels()
             ax.legend(h, l)
         return averaged
 
     def plot_sw_shapes(self, ax):
-        t_ = np.arange(-0.4, 0.4, 1 / 400)
         for name, v in self.avg_shw_shapes.items():
             temp = self.temps[name]
+            t_ = np.linspace(-self.shw_duration/2, self.shw_duration/2, len(v))
             ax.plot(t_, v, label=f'{temp}', color=self.colors[int(temp)])
         ax.set_xlabel('Time [sec]', fontsize=9)
         ax.set_ylabel('Voltage [mV]', fontsize=9)
@@ -316,6 +318,13 @@ class StellaPlotter:
 
     def plot_sw_avg_rate(self, ax):
         self._plot_general_metric(ax, 'all_night_avg', use_stat=False, label='mean rate')
+
+    @staticmethod
+    def get_rec_temperature(rp):
+        temp = rp.excel_table.get('tempMedian')
+        if not temp or (isinstance(temp, float) and np.isnan(temp)):
+            temp = rp.excel_table.get('Temp')
+        return temp
 
     @property
     def cached_variables(self):

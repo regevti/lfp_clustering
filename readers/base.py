@@ -1,6 +1,8 @@
+import datetime
 import re
 from typing import Union
 import pywt
+from dateutil import parser
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -14,7 +16,6 @@ from dataclasses import dataclass
 from neo.rawio import NeuralynxRawIO, RawBinarySignalRawIO
 from readers.openephys import OpenEphysRawIO
 from utils import butter_lowpass_filter, butter_bandpass_filter, butter_highpass_filter, apply_parallel_dask
-
 
 DEFAULT_TABLE = '/media/sil2/Data/Lizard/Stellagama/brainStatesSS.xlsx'
 
@@ -32,6 +33,7 @@ class Reader:
     fs: int = None
     desired_fs: int = None
     recording_fs: int = None
+    start_timestamp: datetime.datetime = None
     excel_table: Union[str, pd.DataFrame] = None  # path for alternative excel table or Dataframe
     use_multiprocessing = True
     use_slow_cycles = True
@@ -49,6 +51,7 @@ class Reader:
         self.load_rec_params()
         self._init_reader()
         self.load_metadata()
+        self.load_start_timestamp()
         assert self.fs is not None, 'No sampling frequency was loaded'
         self.w = int(self.fs * self.window)
         self.noverlap = int(self.w * self.overlap)
@@ -57,7 +60,6 @@ class Reader:
         return f'{self.animal_id},{self.rec_id}'
 
     def load_rec_params(self):
-        # re.match(rf'\w+')
         res = self.excel_table.query(f'Animal=="{self.animal_id}" and recNames=="{self.rec_id}"')
         if res.empty:
             raise Exception(f'unable to find recording for animal_id: {self.animal_id} and rec: {self.rec_id}')
@@ -127,6 +129,9 @@ class Reader:
 
     def _parse_header(self):
         raise NotImplemented('No _parse_header function')
+
+    def load_start_timestamp(self):
+        pass
 
     def read_segmented(self, v):
         return buffer(v, self.w, self.noverlap, self.decimate_q)
@@ -252,6 +257,19 @@ class Reader:
     def analysis_folder(self):
         return self.root_dir / 'analysis' / f'Animal={self.animal_id},recNames={self.rec_id}'
 
+    @property
+    def t_lights_off(self):
+        if self.start_timestamp:
+            dt_off = datetime.datetime.combine(self.start_timestamp.date(), datetime.time(hour=19))
+            return (dt_off - self.start_timestamp).total_seconds()
+
+    @property
+    def t_lights_on(self):
+        if self.start_timestamp:
+            next_day = self.start_timestamp.date() + datetime.timedelta(days=1)
+            dt_on = datetime.datetime.combine(next_day, datetime.time(hour=7))
+            return (dt_on - self.start_timestamp).total_seconds()
+
 
 class NeoReader(Reader):
     """Readers based on the neo package. https://neo.readthedocs.io/"""
@@ -328,6 +346,12 @@ class OpenEphysReader(NeoReader):
         t_stop = self.reader.segment_t_stop(block_index=0, seg_index=0)
         return np.arange(0, t_stop - t_start, (1 / self.recording_fs))
 
+    def load_start_timestamp(self):
+        try:
+            self.start_timestamp = parser.parse(self.reader.raw_annotations['blocks'][0]['segments'][0]['date_created'])
+        except ImportError:
+            self.print('unable to parse start timestamp')
+
 
 class BinaryReader(NeoReader):
     _parser_cls = RawBinarySignalRawIO
@@ -373,6 +397,22 @@ class BinaryReader(NeoReader):
                 raise Exception(f'Cannot find analysis folder in {analysis_dir} and {alternative}')
 
         return analysis_dir / f'Animal={self.animal_id},recNames={rec_id}'
+
+    def load_start_timestamp(self):
+        try:
+            for p in self.root_dir.parts[:4:-1]:
+                m_long = re.search(r'\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}', p)
+                m_short = re.search(r'\d{2}_\d{2}_2\d', p)
+                if not (m_long or m_short):
+                    continue
+
+                if m_long:
+                    self.start_timestamp = datetime.datetime.strptime(m_long.group(), '%Y-%m-%d_%H-%M-%S')
+                else:
+                    # TODO: find a better way to load the start_timestamp for binary recordings with no timestamp in root_dir
+                    self.start_timestamp = datetime.datetime.strptime(f'{m_short.group()}_17-00-00', '%d_%m_%y_%H-%M-%S')
+        except:
+            pass
 
 
 class ExcelReader:
