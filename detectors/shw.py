@@ -12,6 +12,8 @@ from mne.time_frequency import morlet
 from scipy.interpolate import interp1d
 from scipy.signal import find_peaks, filtfilt, resample, lfilter, convolve, correlate
 from scipy.io import loadmat, savemat
+
+import utils
 from readers.mat_files import MatRecordingsParser
 from utils import half_max_x, apply_parallel_dask, run_parallel, cpu_count
 
@@ -214,20 +216,22 @@ class SharpWavesFinder:
         self.print(f'# of slow waves: {n_shw}')
         return V
 
-    def plot_sharp_waves_detection(self, t_start, t_end, ax, ax2):
-        idx = np.where((self.t >= t_start) & (self.t <= t_end))[0]
-        v = self.v[idx]
-        t = self.t[idx]
-        sf = self.shw_df.query(f'start>={idx[0]} and end<={idx[-1]}')
+    def plot_sharp_waves_detection(self, rp, mfilt, t_start, t_end, ax, ax2):
+        v, t = rp.read(t_start=t_start, t_stop=t_end)
+        v = utils.smooth_signal(v, poly_order=7)
         ax.plot(t, v, 'k')
-        for i, row in sf.iterrows():
-            ax.axvspan(self.t[int(row.start)], self.t[int(row.end)], facecolor='g', alpha=0.4)
         ax.axis('off')
         ylim = ax.get_ylim()
         self.print(f'Ylim: {ylim[1] - ylim[0]}')
-        conv = self.norm_conv[idx]
+
+        power = -filtfilt(mfilt, 1, v)
+        conv = power / power.max()
         peaks_, _ = find_peaks(conv, height=self.thresh, distance=self.fs * 0.5, width=self.fs * 0.1)
-        peaks_ = [p for p in peaks_ if p > 0 and v[p] < -10]
+        peaks_ = [p for p in peaks_ if p > 0 and v[p] < -20]
+        mw = self.shw_w // 2
+        for peak in peaks_:
+            ax.axvspan(t[max([peak-mw, 0])], t[min([len(t)-1, peak+mw])], facecolor='g', alpha=0.4)
+
         ax2.plot(t, conv, 'k')
         ax2.scatter(t[peaks_], conv[peaks_], c='g', alpha=0.4)
         ax2.axis('off')
@@ -281,16 +285,18 @@ class SharpWavesFinder:
     def calc_sw_rate(self, wt, overlap=0.75, label=None, lights_off_only=False) -> pd.DataFrame:
         """Calculate the rate of slow-waves across all recording"""
         noverlap = int(wt * overlap)
-        rf = pd.DataFrame(columns=['rate', 'time', 'group_time', 'group', 'signal', 'datetime'])
+        rf = []
         sig_df = self.shw_df.query(f'label=={label}') if label is not None else self.shw_df.copy()
-        idx = (sig_df.start + self.shw_w).to_numpy().astype(int)
-        idx = idx[idx < len(self.t)]  # remove out of range indices
-        sws_times = self.t[idx]
+        sws_times = sig_df.t_start.values
         startT = 0
-        endT = self.t.max()
+        endT = self.reader.time_vector[-1]
+
         if lights_off_only:
-            startT = self.t[self.reader.lights_off_id] - 2 * 60 * 60
-            endT = self.t[self.reader.lights_on_id] + 2 * 60 * 60
+            startT = self.reader.t_lights_off - 2 * 60 * 60
+            if startT < 0:
+                startT = 0
+            endT = self.reader.t_lights_on + 2 * 60 * 60
+
         for t_start in np.arange(startT, endT - wt, wt - noverlap):
             r = len(sws_times[(sws_times >= t_start) & (sws_times < t_start + wt)])
             sc_id = np.where((self.sc['on'] <= t_start) &
@@ -303,12 +309,13 @@ class SharpWavesFinder:
             else:
                 group = np.nan
                 group_time = np.nan
-            if self.reader.t_start is not None:
-                dt = self.reader.t_start + pd.to_timedelta(t_start, unit='seconds')
+            if self.reader.start_timestamp is not None:
+                dt = self.reader.start_timestamp + pd.to_timedelta(t_start, unit='seconds')
             else:
                 dt = None
-            rf = rf.append({'rate': r, 'time': t_start + (wt/2), 'group_time': group_time, 'group': group,
-                            'signal': sc_id, 'datetime': dt}, ignore_index=True)
+            rf.append({'rate': r, 'time': t_start + (wt/2), 'group_time': group_time, 'group': group,
+                       'signal': sc_id, 'datetime': dt})
+        rf = pd.DataFrame(rf)
         return rf
 
     def calc_cycle_sw_rate(self, wt=5, overlap=0.75, interp_step=1, group_length=50, rf=None):

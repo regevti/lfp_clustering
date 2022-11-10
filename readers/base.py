@@ -1,7 +1,9 @@
+import datetime
 import re
 import os
 from typing import Union
 import pywt
+from dateutil import parser
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -32,6 +34,7 @@ class Reader:
     fs: int = None
     desired_fs: int = None
     recording_fs: int = None
+    start_timestamp: datetime.datetime = None
     excel_table: Union[str, pd.DataFrame] = None  # path for alternative excel table or Dataframe
     use_multiprocessing = True
     use_slow_cycles = True
@@ -49,6 +52,7 @@ class Reader:
         self.load_rec_params()
         self._init_reader()
         self.load_metadata()
+        self.load_start_timestamp()
         assert self.fs is not None, 'No sampling frequency was loaded'
         self.w = int(self.fs * self.window)
         self.noverlap = int(self.w * self.overlap)
@@ -57,7 +61,6 @@ class Reader:
         return f'{self.animal_id},{self.rec_id}'
 
     def load_rec_params(self):
-        # re.match(rf'\w+')
         res = self.excel_table.query(f'Animal=="{self.animal_id}" and recNames=="{self.rec_id}"')
         if res.empty:
             raise Exception(f'unable to find recording for animal_id: {self.animal_id} and rec: {self.rec_id}')
@@ -127,6 +130,9 @@ class Reader:
 
     def _parse_header(self):
         raise NotImplemented('No _parse_header function')
+
+    def load_start_timestamp(self):
+        pass
 
     def read_segmented(self, v):
         return buffer(v, self.w, self.noverlap, self.decimate_q)
@@ -252,6 +258,19 @@ class Reader:
     def analysis_folder(self):
         return self.root_dir / 'analysis' / f'Animal={self.animal_id},recNames={self.rec_id}'
 
+    @property
+    def t_lights_off(self):
+        if self.start_timestamp:
+            dt_off = datetime.datetime.combine(self.start_timestamp.date(), datetime.time(hour=19))
+            return (dt_off - self.start_timestamp).total_seconds()
+
+    @property
+    def t_lights_on(self):
+        if self.start_timestamp:
+            next_day = self.start_timestamp.date() + datetime.timedelta(days=1)
+            dt_on = datetime.datetime.combine(next_day, datetime.time(hour=7))
+            return (dt_on - self.start_timestamp).total_seconds()
+
 
 class NeoReader(Reader):
     """Readers based on the neo package. https://neo.readthedocs.io/"""
@@ -328,20 +347,6 @@ class OpenEphysReader(NeoReader):
         t_stop = self.reader.segment_t_stop(block_index=0, seg_index=0)
         return np.arange(0, t_stop - t_start, (1 / self.recording_fs))
 
-    def add_CH_to_filename(self):
-        """
-        this method is used only for OE files.
-        the method adds CH to the filename in the format: "100_#.continuous" to "100_CH#.continuous".
-        It will not add CH if it's already there. written by: Milan
-        """
-        files = list(self.root_dir.glob('100_*'))
-
-        for file_name in files:
-            if 'CH' not in file_name.name:
-                split_name = file_name.name.rsplit('_', 1)
-                new_name = split_name[0] + '_CH' + split_name[1]
-                os.rename(file_name.as_posix(), f'{file_name.parent}/{new_name}')
-
 
 class BinaryReader(NeoReader):
     _parser_cls = RawBinarySignalRawIO
@@ -387,6 +392,22 @@ class BinaryReader(NeoReader):
                 raise Exception(f'Cannot find analysis folder in {analysis_dir} and {alternative}')
 
         return analysis_dir / f'Animal={self.animal_id},recNames={rec_id}'
+
+    def load_start_timestamp(self):
+        try:
+            for p in self.root_dir.parts[:4:-1]:
+                m_long = re.search(r'\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}', p)
+                m_short = re.search(r'\d{2}_\d{2}_2\d', p)
+                if not (m_long or m_short):
+                    continue
+
+                if m_long:
+                    self.start_timestamp = datetime.datetime.strptime(m_long.group(), '%Y-%m-%d_%H-%M-%S')
+                else:
+                    # TODO: find a better way to load the start_timestamp for binary recordings with no timestamp in root_dir
+                    self.start_timestamp = datetime.datetime.strptime(f'{m_short.group()}_17-00-00', '%d_%m_%y_%H-%M-%S')
+        except:
+            pass
 
 
 class ExcelReader:
