@@ -44,7 +44,7 @@ class MotifFinder:
         self.cache_dir = None
 
     def search(self, t_start=None, t_stop=None, v=None, durations=(2, 0.4), durations2remove=None, max_xcorr=0.8,
-               is_cache=False, is_avg_motives=False, is_remove_corr=True, external_motives=()):
+               is_cache=False, is_avg_motives=False, is_remove_corr=True, external_motives=(), bf=None):
         """
         Search for motives in a given signal
         @param t_start: start time in seconds
@@ -88,7 +88,7 @@ class MotifFinder:
             self.cache_dir = self.get_cache_dir()
             self.save_cache()
 
-        self.plot_search_summary(t_start, t_stop, is_save=is_cache)
+        self.plot_search_summary(t_start, t_stop, is_save=is_cache, bf=bf)
         return self.cache_dir.as_posix() if is_cache else None
 
     def find_duration_motif(self, v, window_duration, max_motifs=20) -> Tuple[np.ndarray, int]:
@@ -211,9 +211,13 @@ class MotifFinder:
                 M[motif_id1, motif_id2] = len(set(full_idx1) & set(full_idx2)) / len(full_idx1)
         return M
 
-    def plot_search_summary(self, t_start, t_stop, max_dist=35, cols=5, is_save=False):
-        probs, counts = self.sleep_cycles_stats(max_dist=max_dist, t_start=t_start, t_stop=t_stop, is_plot=False)
-        signal_types = ['sws', 'rem']
+    def plot_search_summary(self, t_start, t_stop, max_dist=35, cols=5, is_save=False, bf=None):
+        if bf is None:
+            probs, counts = self.sleep_cycles_stats(max_dist=max_dist, t_start=t_start, t_stop=t_stop, is_plot=False)
+        else:
+            probs, counts = self.strikes_stats(bf, max_dist=max_dist, t_start=t_start, t_stop=t_stop, is_plot=False)
+
+        signal_types = ['sws', 'rem'] if bf is None else ['before', 'after']
         probs2 = [{k: p[k] for k in signal_types} for p in probs]
         for stype in signal_types:
             motives_ids = [i for i, p in enumerate(probs2) if max(p, key=p.get)==stype]
@@ -231,8 +235,13 @@ class MotifFinder:
                 axes[ax_id].plot(t, m)
                 axes[ax_id].set_title(f'Motif ID:{i} (window={self.windows[i]/self.fs:.1f}sec)', fontsize=16, weight='bold')
                 ymin, _ = axes[ax_id].get_ylim()
-                axes[ax_id].text(0, ymin+1, f'P(m|REM)={probs[i]["rem"]:.2f}\nP(m|SWS)={probs[i]["sws"]:.2f}\nCount={c}',
-                             color='red', fontsize=16, weight='bold')
+                if bf is None:
+                    axes[ax_id].text(0, ymin+1, f'P(m|REM)={probs[i]["rem"]:.2f}\nP(m|SWS)={probs[i]["sws"]:.2f}\nCount={c}',
+                                 color='red', fontsize=16, weight='bold')
+                else:
+                    axes[ax_id].text(0, ymin + 1,
+                                     f'P(m|AFTER)={probs[i]["after"]:.3f}\nP(m|BEFORE)={probs[i]["before"]:.3f}\nCount={c}',
+                                     color='red', fontsize=16, weight='bold')
             fig.suptitle(f'{stype.upper()} Motives', fontsize=20)
             fig.tight_layout(rect=[0, 0.03, 1, 0.95])
             if is_save:
@@ -351,17 +360,102 @@ class MotifFinder:
             fig.savefig(f'labelled_cycle_{cycle_id}.png')
             plt.close(fig)
 
-    def sleep_cycles_stats(self, motives_ids=None, max_dist=30, t_start=None, t_stop=None, is_plot=True):
+    def plot_labelled_strikes(self, bf, motives_ids=None, max_dist=20, is_save=False,
+                             colors=None, is_separate=True):
+        colors = colors or COLORS
+        v, t = self.read_signal()
         if motives_ids is None:
             motives_ids = list(range(len(self.motives)))
-        sc = self.rd.load_slow_cycles()
+        rows = len(motives_ids) if is_separate else 1
+        fig = plt.figure(figsize=(30, 5*rows))
+        outer = fig.add_gridspec(1, 2, wspace=0.1, width_ratios=[1, 9])
+        examples_grid = outer[0].subgridspec(len(motives_ids), 1, wspace=0, hspace=0)
+        signal_grid = outer[1].subgridspec(rows, 1, wspace=0, hspace=0)
+        signal_axes = signal_grid.subplots()
+        examples_axes = examples_grid.subplots()
+        if not is_separate or len(motives_ids) == 1:
+            signal_axes = [signal_axes]
+        if len(motives_ids) == 1:
+            examples_axes = [examples_axes]
+
+        for j, ax in enumerate(signal_axes):
+            if not is_separate:
+                t = t - t[0]
+            ax.plot(t, v, color='black')
+            ax.set_xlabel('Time [sec]')
+            ax.set_ylabel('Voltage [mV]')
+
+        for j, motif_id in enumerate(motives_ids):
+            ax = examples_axes[j]
+            motif_ = self.motives[motif_id] if isinstance(motif_id, int) else motif_id
+            ax.plot(motif_, color=colors[j])
+            ax.axes.xaxis.set_visible(False)
+            ax.axes.yaxis.set_visible(False)
+            if j == 0:
+                ax.set_title('Motives')
+            sig_ax = signal_axes[j if is_separate else 0]
+            max_dist_ = max_dist[j] if isinstance(max_dist, list) else max_dist
+            idx, dists = self.mass_motif_search(motif_id, v, max_dist=max_dist_, is_cache=False)
+            for i, m_id in enumerate(idx):
+                t_, v_ = t[m_id:m_id+len(motif_)], v[m_id:m_id+len(motif_)]
+                motif_label = motif_id if isinstance(motif_id, int) else "external"
+                sig_ax.plot(t_, v_, color=colors[j],
+                            label=f'Motif ID: {motif_label}' if i == 0 else None)
+                if is_separate:
+                    sig_ax.text(t_[0], max(v_)+2, f'{dists[m_id]:.0f}\n{np.std(v_):.1f}')
+
+        for ax in signal_axes:
+            for i, row in bf.iterrows():
+                ax.legend()
+                ax.axvline(row.oe_time, color='red')
+        if is_save:
+            fig.savefig(f'labelled_strikes.png')
+            plt.close(fig)
+
+    def scan_for_stats(self, motives_ids, t_start, t_stop, max_dist):
+        if motives_ids is None:
+            motives_ids = list(range(len(self.motives)))
         v, t = self.read_signal(t_start, t_stop)
         time_vectors = []
         for i, motif_id in enumerate(motives_ids):
             max_dist_ = max_dist[i] if isinstance(max_dist, list) else max_dist
             idx, _ = self.mass_motif_search(motif_id, v, is_cache=(not t_start and not t_stop), max_dist=max_dist_)
             time_vectors.append(t[idx])
+        return time_vectors, t
 
+    def strikes_stats(self, bf, window=4, motives_ids=None, max_dist=30, t_start=None, t_stop=None, is_plot=True):
+        time_vectors, t = self.scan_for_stats(motives_ids, t_start, t_stop, max_dist)
+        durations = {'before': 0, 'after': 0}
+        motives_durations = [{'before': 0, 'after': 0} for _ in time_vectors]
+        for _, row in bf.iterrows():
+            if (t_stop and row.oe_time + window >= t_stop) or (t_start and row.oe_time - window <= t_start):
+                continue
+            durations['before'] += (row.oe_time - window)
+            durations['after'] += (row.oe_time + window)
+            for i, t_ in enumerate(time_vectors):
+                d = self.windows[i]/self.fs
+                motives_durations[i]['before'] += sum([(d if ts+d<row.oe_time else row.oe_time - ts)
+                                                      for ts in t_[(row.oe_time-window <= t_) & (t_ < row.oe_time)]])
+                motives_durations[i]['after'] += sum([(d if ts+d<row.oe_time+window else row.oe_time+window - ts)
+                                                      for ts in t_[(row.oe_time <= t_) & (t_ < row.oe_time+window)]])
+        total_duration = t[-1] - t[0]
+        out_duration = total_duration - (durations['before'] + durations['after'])
+        if is_plot:
+            fig, axes = plt.subplots(len(motives_ids), 2, figsize=(10, len(motives_ids)*3))
+        motives_probs, motives_counts = [], []
+        for i, md in enumerate(motives_durations):
+            p_sws, p_rem = md['before']/durations['before'], md['after']/durations['after']
+            p_out = (len(time_vectors[i]) - (md['before'] + md['after'])) / out_duration if out_duration > 1 else 0
+            motives_probs.append({'before': p_sws, 'after': p_rem, 'control': p_out})
+            motives_counts.append(len(time_vectors[i]))
+            if is_plot:
+                axes[i, 0].plot(self.motives[motives_ids[i]])
+                axes[i, 1].bar(['Before Strike', 'After Strike', 'Control'], [p_sws, p_rem, p_out])
+        return motives_probs, motives_counts
+
+    def sleep_cycles_stats(self, motives_ids=None, max_dist=30, t_start=None, t_stop=None, is_plot=True):
+        time_vectors, t = self.scan_for_stats(motives_ids, t_start, t_stop, max_dist)
+        sc = self.rd.load_slow_cycles()
         durations = {'rem': 0, 'sws': 0}
         motives_durations = [{'rem': 0, 'sws': 0} for _ in time_vectors]
         for _, row in sc.iterrows():

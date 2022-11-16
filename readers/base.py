@@ -435,6 +435,7 @@ class ExcelReader:
         return self.rec_table._repr_html_()
 
     def get(self, animal_id, rec_id, desired_fs=None):
+        # TODO: add option to change channel, also to multi channels
         res = self.get_row(animal_id, rec_id)
         rp = self[res.index[0]]
         if desired_fs:

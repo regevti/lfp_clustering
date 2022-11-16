@@ -374,7 +374,7 @@ class StellaReviewPlotter:
 
         fig = plt.figure(tight_layout=True, figsize=(16, 3*4))
         gs = gridspec.GridSpec(3, 3)
-        example_swf, example_id = self.plot_shw_example(fig.add_subplot(gs[0, 0]))
+        example_swf, example_id, example_v, example_t = self.plot_shw_example(fig.add_subplot(gs[0, 0]))
         spec, t_spec, f_spec = self.run_cwt(example_swf, [example_id])
         self.plot_cwt(spec, t_spec, f_spec, fig.add_subplot(gs[1, 0]), is_log_norm=False)
         B, t_flt, _ = self.get_filtered_shw(example_swf, [example_id])
@@ -382,6 +382,11 @@ class StellaReviewPlotter:
         self.plot_filtered_trace(B, t_flt, fig.add_subplot(gs[2, 0]))
 
         all_animals_data = self.analyze_all_animals()
+
+        with open('../output/ripples.pkl', 'wb') as f:
+            pickle.dump({'all_animals_data': all_animals_data, 'spec': spec, 't_spec': t_spec, 'f_spec': f_spec,
+                         'B': B, 't_flt': t_flt, 'example_v': example_v, 'example_t': example_t}, f)
+
         self.plot_all_animals_band(fig.add_subplot(gs[1:, 1]), all_animals_data)
         self.plot_all_animals_cwt(fig.add_subplot(gs[0, 1]), all_animals_data)
 
@@ -398,6 +403,7 @@ class StellaReviewPlotter:
                 if swf is None:
                     continue
 
+                print(f'>> Start analyzing {rp}')
                 # shw_df_ = swf.shw_df.query('0.1<=width<0.3 and depth>180 and power>0.3')
                 shw_indices = swf.shw_df.sort_values(by='power', ascending=False).start.values.tolist()
                 if len(shw_indices) > max_shws:
@@ -408,6 +414,7 @@ class StellaReviewPlotter:
                 print(f'{rp} | #ShW={len(shw_indices)}')
                 # self.save_shw_timestamps(rp, swf, shw_indices)
                 t_flt, y_flt, t_avg, y_avg, shw_indices = self.run_filtered_and_avg(swf, shw_indices, padding)
+
                 if str(rp) in self.cwt_recs:
                     if len(shw_indices) > max_cwt_per_animal:
                         shw_indices = shw_indices[:max_cwt_per_animal]
@@ -563,7 +570,7 @@ class StellaReviewPlotter:
         ax.set_ylabel('Frequency [Hz]')
 
     def plot_shw_example(self, ax):
-        example_rp = self.all_animals_xls.get('SA07', '4', desired_fs=1000)
+        example_rp = self.all_animals_xls.get('SA07', 'sleepNight4', desired_fs=1000)
         example_id = '429177323'
         swf = self.train_finder(example_rp, shw_duration=1.2)
         v_, t_ = swf.shw_records[example_id]
@@ -571,7 +578,7 @@ class StellaReviewPlotter:
         ax.set_xlabel('Time [sec]')
         ax.set_ylabel('Voltage [mV]')
         ax.grid(False)
-        return swf, example_id
+        return swf, example_id, v_, t_ - t_[0]
 
     def plot_best_shw(self, rp, n=30, cols=4):
         swf = self.train_finder(rp)
