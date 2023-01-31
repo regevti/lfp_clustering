@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+import cv2
 import pandas as pd
 import numpy as np
 from tqdm.auto import tqdm
@@ -8,14 +10,15 @@ from readers.base import NeoReader
 
 
 # duration before and after the strike time
-SEC_BEFORE = 2
-SEC_AFTER = 2
+SEC_BEFORE = 4
+SEC_AFTER = 4
 
 
 class StrikesOE:
     def __init__(self, rp: NeoReader):
         self.rp = rp
         self.session_dir = rp.root_dir.parent.parent
+        self.behavior_events = None
         self.bf = self.load_strikes_data()
         self.miny = 0
         self.segs = []
@@ -27,6 +30,7 @@ class StrikesOE:
         frames_ts, frames_dt = self.load_frames_times()
         oe_frames_ts = self.get_frames_in_oe_time(trig, frames_ts)
         bf = self.convert_reptilearn_events_time(bf, frames_dt, oe_frames_ts)
+        self.load_strikes_frames_events(oe_frames_ts)
         return bf
 
     def load_strikes_from_events(self):
@@ -62,9 +66,10 @@ class StrikesOE:
         def _convert(t: pd.Timestamp):
             assert frames_dt[0] <= t <= frames_dt[-1], f'{t} is not in range: [{frames_dt[0]}, {frames_dt[-1]}]'
             i = np.argmin(np.abs((frames_dt - t).total_seconds()))
-            return oe_frames_ts[i]
+            return pd.Series([oe_frames_ts[i], i])
 
-        bf['oe_time'] = bf.time.apply(_convert)
+        bf[['oe_time', 'frame_id']] = bf.time.apply(_convert)
+        bf['frame_id'] = bf.frame_id.astype(int)
         return bf
 
     def load_triggers(self):
@@ -80,21 +85,71 @@ class StrikesOE:
         frames_dt = pd.to_datetime(frames_ts, unit='s').tz_localize("utc").tz_convert('Asia/Jerusalem')
         return frames_ts, frames_dt
 
+    def load_strikes_frames_events(self, oe_frames_ts):
+        if not self.behavior_events_file_path.exists():
+            print(f'file {self.behavior_events_file_path} does not exist')
+            return
+        self.behavior_events = pd.read_csv(self.behavior_events_file_path)
+        for c in self.behavior_events.columns:
+            self.behavior_events[f'{c}_time'] = self.behavior_events[c].map(
+                lambda x: oe_frames_ts[int(x)] if x and not np.isnan(x) else None)
+
+    def plot_behavior_events(self):
+        if self.behavior_events is None:
+            print('unable to plot; behavior events does not exist')
+            return
+
+        idx = self.behavior_events[self.behavior_events.isna().any(axis=1)].index
+        bhf = self.behavior_events.drop(idx)
+
+        fig, ax = plt.subplots(1, 1, dpi=150)
+        vs, ts = [], []
+        for i, row in bhf.iterrows():
+            v_, t_ = self.rp.read(t_start=row.approach_time - 1, t_stop=row.strike_time + 1)
+            vs.append(v_)
+            ts.append(t_ - t_[0])
+
+        max_index = int(np.argmin([t[-1] for t in ts]))
+        global_t = ts[max_index]
+        for i, (v_, t_) in enumerate(zip(vs, ts)):
+            v_ = np.interp(global_t, t_, v_)
+            ax.plot(global_t, v_ + (i * 300), color='k', linewidth=0.5)
+
+        lines = {'approach': 'b', 'tongue': 'g', 'strike': 'r'}
+        for l, color in lines.items():
+            row = bhf.iloc[max_index]
+            ax.axvline(row[f'{l}_time'] - row.approach_time + 1, color=color, linewidth=1.5, label=l)
+        ax.legend()
+        ax.set_yticks([])
+        ax.set_xlabel('Time [sec]')
+
+    def extract_relevant_frames_to_files(self, sec_back=3):
+        video_files = list(self.session_dir.rglob('top*.mp4'))
+        frames_ts = pd.read_csv(video_files[0].with_suffix('.csv')).timestamp.values
+        fps = 1 / np.diff(frames_ts).mean()
+        assert len(video_files) == 1
+        n_frames_back = round(fps * sec_back)
+        for frame_id in tqdm(self.bf.frame_id.values):
+            frame_dir = self.cache_dir / str(frame_id)
+            frame_dir.mkdir(exist_ok=True, parents=True)
+            start_frame = frame_id - n_frames_back
+            cap = cv2.VideoCapture(video_files[0].as_posix())
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            for i in range(start_frame, frame_id + 1):
+                ret, frame = cap.read()
+                cv2.imwrite((frame_dir / f'{str(i)}.jpg').as_posix(), frame)
+            cap.release()
+
     @staticmethod
     def get_frames_in_oe_time(oe_trig, frames_ts, mode='same'):
-        # oe_trig, frames_ts = oe_trig.copy(), frames_ts.copy()
-        # x = (oe_trig - oe_trig.min()) / (oe_trig.max() - oe_trig.min())
-        # y = (frames_ts - frames_ts.min()) / (frames_ts.max() - frames_ts.min())
-        # corr = correlate(x, y, mode=mode)
-        # lags = correlation_lags(x.size, y.size, mode=mode)
-        # lag = lags[np.argmax(corr)]
-        # print(f'Lag index: {lag}, {y.size}')
-        # plt.figure()
-        # plt.plot(lags, corr)
-        # if lag > 0:
-        #     oe_trig = oe_trig[lag:]
-        # elif lag < 0:
-        #     frames_ts = frames_ts[lag:]
         i = np.where(np.diff(oe_trig) > 1)[0][0]
         frames_ts = frames_ts - frames_ts[0] + oe_trig[i+1]
         return frames_ts
+
+    @property
+    def cache_dir(self) -> Path:
+        return self.session_dir / 'regev_cache'
+
+    @property
+    def behavior_events_file_path(self) -> Path:
+        return self.cache_dir / 'strikes_events_in_frames.csv'
