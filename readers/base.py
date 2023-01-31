@@ -61,14 +61,14 @@ class Reader:
         return f'{self.animal_id},{self.rec_id}'
 
     def load_rec_params(self):
-        res = self.excel_table.query(f'Animal=="{self.animal_id}" and recNames=="{self.rec_id}"')
-        if res.empty:
-            raise Exception(f'unable to find recording for animal_id: {self.animal_id} and rec: {self.rec_id}')
-        if len(res) > 1:
-            raise Exception(f'more than one option for animal_id: {self.animal_id} and rec: {self.rec_id}')
-        self.excel_table = res.iloc[0]
-
         if not self.root_dir:
+            res = self.excel_table.query(f'Animal=="{self.animal_id}" and recNames=="{self.rec_id}"')
+            if res.empty:
+                raise Exception(f'unable to find recording for animal_id: {self.animal_id} and rec: {self.rec_id}')
+            if len(res) > 1:
+                raise Exception(f'more than one option for animal_id: {self.animal_id} and rec: {self.rec_id}')
+            self.excel_table = res.iloc[0]
+
             self.root_dir = self.excel_table.folder
             if not self.channel:
                 self.channel = self.excel_table.defaulLFPCh
@@ -430,6 +430,7 @@ class ExcelReader:
         return self.rec_table._repr_html_()
 
     def get(self, animal_id, rec_id, desired_fs=None):
+        # TODO: add option to change channel, also to multi channels
         res = self.get_row(animal_id, rec_id)
         rp = self[res.index[0]]
         if desired_fs:
